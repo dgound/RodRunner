@@ -1,0 +1,27 @@
+# Compiled C libraries
+*.so
+*.o
+*.a
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local config / potential secrets (never commit)
+.zshrc
+.mcp.json
+.claude/
+.codex
+
+# SLURM logs
+logs/
+*.out

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rodrunner"
+version = "1.0.0"
+description = "OligoSTORM widefield imaging pipeline for Salmo chromosome tracing"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "tifffile",
+    "cellpose>=3.0",
+    "matplotlib",
+    "scikit-image",
+]
+
+[project.optional-dependencies]
+gpu = ["torch"]
