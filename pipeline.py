@@ -61,12 +61,12 @@ def parse_args(argv=None):
                     help='Explicit location list (overrides --location-glob)')
 
     geom = p.add_argument_group('detector geometry')
-    geom.add_argument('--xy-pixel-nm', type=float, default=103.28,
-                      help='Lateral pixel size in nm (default: 103.28)')
-    geom.add_argument('--z-step-nm', type=float, default=100.0,
-                      help='Axial step size in nm (default: 100.0)')
-    geom.add_argument('--fov-size', type=int, default=1866,
-                      help='FOV size in pixels, assumed square (default: 1866)')
+    geom.add_argument('--xy-pixel-nm', type=float, default=None,
+                      help='Lateral pixel size in nm (auto-detected from data.json)')
+    geom.add_argument('--z-step-nm', type=float, default=None,
+                      help='Axial step size in nm (auto-detected from data.json)')
+    geom.add_argument('--fov-size', type=int, default=None,
+                      help='FOV size in pixels, assumed square (auto-detected from data.json)')
     geom.add_argument('--sigma-z-max', type=float, default=3.5,
                       help='Axial sigma cap in voxels, 0 = uncapped (default: 3.5)')
 
@@ -129,6 +129,34 @@ def parse_args(argv=None):
                             '(default: output directory name)')
 
     return p.parse_args(argv)
+
+
+_GEOM_DEFAULTS = dict(xy_pixel_nm=103.28, z_step_nm=100.0, fov_size=1866)
+
+
+def _auto_detect_geometry(input_dir, locations):
+    """Read geometry from the first location's data.json."""
+    for loc in locations:
+        data_json = Path(input_dir) / loc / 'Raw Images' / 'data.json'
+        if not data_json.is_file():
+            continue
+        try:
+            with open(data_json) as f:
+                d = json.load(f)
+            v = d['value']
+            img = v['Image']
+            rec = v['Recording']
+            px = round((img['PixelSizeX'] + img['PixelSizeY']) / 2, 2)
+            return dict(
+                xy_pixel_nm=px,
+                z_step_nm=abs(rec['ZStepSize']),
+                fov_size=img['DimX'],
+            )
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            print(f'WARNING: could not parse {data_json}: {exc}',
+                  file=sys.stderr)
+            return None
+    return None
 
 
 def discover_locations(input_dir, location_glob, source):
@@ -425,6 +453,20 @@ def main(argv=None):
         print(f'No locations found under {args.input} '
               f'matching {args.location_glob}', file=sys.stderr)
         return 1
+
+    if args.source == 'dat':
+        detected = _auto_detect_geometry(args.input, locations)
+        if detected:
+            for key, val in detected.items():
+                if getattr(args, key) is None:
+                    setattr(args, key, val)
+                    print(f'auto-detected {key}={val} from data.json')
+        elif any(getattr(args, k) is None for k in _GEOM_DEFAULTS):
+            print('WARNING: no data.json found, falling back to hardcoded '
+                  'geometry defaults', file=sys.stderr)
+    for key, val in _GEOM_DEFAULTS.items():
+        if getattr(args, key) is None:
+            setattr(args, key, val)
 
     output_dir = str(Path(args.output).resolve())
     os.makedirs(output_dir, exist_ok=True)
