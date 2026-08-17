@@ -79,6 +79,10 @@ _ap.add_argument(
     help="Failure behavior for weak or ambiguous DAPI z gates in "
          "2p5d-zgated mode. (default: %(default)s)",
 )
+_ap.add_argument(
+    '--diameter', type=int, default=20,
+    help='Expected cell diameter in pixels for Cellpose. (default: %(default)s)',
+)
 _args, _ = _ap.parse_known_args()
 
 # Output root. Env-overridable (PIPELINE_OUT) so independent pipeline runs can
@@ -112,7 +116,7 @@ print(f'  Averaged image shape: {avg_img.shape}, range: [{avg_img.min():.0f}, {a
 dapi_path = os.path.join(outdir, 'averaged_dapi.tif')
 tifffile.imwrite(dapi_path, avg_img.astype(np.float32))
 
-# Segment with the updated Cellpose-SAM model, diameter=20
+# Segment with the updated Cellpose-SAM model
 model = CellposeModel(gpu=True, pretrained_model='cpsam_v2')
 print(f'Running cellpose on averaged DAPI (mode={_args.segmentation_mode})...', flush=True)
 
@@ -123,7 +127,7 @@ if _args.segmentation_mode == '3d':
         xy_pixel_nm=_args.xy_pixel_nm,
         z_step_nm=_args.z_step_nm,
         anisotropy=_args.cellpose_3d_anisotropy,
-        diameter=20,
+        diameter=_args.diameter,
         min_size=15,
         max_diameter=40,
     )
@@ -174,7 +178,7 @@ if _args.segmentation_mode in ('2p5d', '2p5d-zgated'):
     projection, masks_2d, masks_3d, summary = segment_2p5d(
         model,
         avg_img,
-        diameter=20,
+        diameter=_args.diameter,
         min_size=15,
         max_diameter=40,
     )
@@ -289,7 +293,7 @@ print(f'  stitch_threshold={_args.stitch_threshold}')
 try:
     masks, flows, styles = model.eval(
         avg_img,
-        diameter=20,
+        diameter=_args.diameter,
         channels=[0, 0],
         z_axis=0,
         do_3D=False,

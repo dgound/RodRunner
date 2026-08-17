@@ -75,6 +75,8 @@ def parse_args(argv=None):
                      choices=('2p5d-zgated', '2p5d', 'stitched', '3d'),
                      default='2p5d-zgated',
                      help='Segmentation mode (default: 2p5d-zgated)')
+    seg.add_argument('--diameter', type=int, default=20,
+                     help='Expected cell diameter in pixels for Cellpose (default: 20)')
     seg.add_argument('--skip-segmentation', action='store_true',
                      help='Use existing masks; requires --mask-dir or masks '
                           'already in --output')
@@ -263,6 +265,7 @@ def process_location(loc, args, work, env):
             '--z_step_nm', str(args.z_step_nm),
             '--stitch_threshold', '0.5',
             '--min_z_extent', '0',
+            '--diameter', str(args.diameter),
         ] + src_args, env)
     else:
         _link_masks(work, args, loc.replace(' ', '_'))
