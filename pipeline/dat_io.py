@@ -25,7 +25,8 @@ def _read_dat_cfg(raw_dir):
     img, rec = v["Image"], v["Recording"]
     return dict(dimX=int(img["RecordDimX"]), dimY=int(img["RecordDimY"]),
                 P=int(rec["NumProbesImaging"]), Z=int(rec["NumZPos"]),
-                T=int(rec["NumTimepoints"]))
+                T=int(rec["NumTimepoints"]),
+                interleaved=rec.get("ZStackMode", "sequential") == "interleaved")
 
 
 def _dat_frames(raw_dir, cfg):
@@ -87,8 +88,9 @@ def iter_timepoints(source_dir, probe, fmt="tiff", glob_pattern="TP*_CYC*.tif"):
     fmt="tiff": source_dir is a probe_N/ folder of TP*.tif (probe is ignored --
                 the folder already selects the channel).
     fmt="dat" : source_dir is a Raw Images/ folder (data.json + *.dat); frames are
-                de-interleaved (z contiguous, probe interleaved, timepoint outer:
-                frame = (tp*P + probe)*Z + z) and only `probe` is yielded, one
+                de-interleaved based on ZStackMode in data.json. Sequential mode:
+                frame = (tp*P + probe)*Z + z. Interleaved mode:
+                frame = tp*P*Z + z*P + probe. Only `probe` is yielded, one
                 z-stack per timepoint.
     """
     if fmt == "tiff":
@@ -98,11 +100,19 @@ def iter_timepoints(source_dir, probe, fmt="tiff", glob_pattern="TP*_CYC*.tif"):
     elif fmt == "dat":
         cfg = _read_dat_cfg(source_dir)
         Z, P, T = cfg["Z"], cfg["P"], cfg["T"]
+        interleaved = cfg["interleaved"]
         frame, total = _dat_frames(source_dir, cfg)
         for tp in range(T):
-            base = (tp * P + probe) * Z
-            if base + Z > total:            # incomplete trailing block
+            if interleaved:
+                # z-planes cycle through probes: frame = tp*P*Z + z*P + probe
+                tp_base = tp * P * Z
+                indices = [tp_base + z * P + probe for z in range(Z)]
+            else:
+                # probes are contiguous blocks: frame = (tp*P + probe)*Z + z
+                base = (tp * P + probe) * Z
+                indices = [base + z for z in range(Z)]
+            if indices[-1] >= total:
                 return
-            yield f"TP{tp:03d}", np.stack([np.asarray(frame(base + z)) for z in range(Z)], 0)
+            yield f"TP{tp:03d}", np.stack([np.asarray(frame(i)) for i in indices], 0)
     else:
         raise ValueError(f"unknown fmt {fmt!r}")
