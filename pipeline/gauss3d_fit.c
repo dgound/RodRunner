@@ -303,8 +303,15 @@ int fit_gaussian_3d(const double *data, const unsigned char *mask,
         for (int i = 0; i < NPAR; i++)
             p_new[i] = p[i] + dp[i];
 
-        /* Enforce bounds */
-        if (p_new[0] < 0) p_new[0] = 0;
+        /* Amplitude: if the step drives A non-positive, reject the step
+         * entirely and increase lambda (same as a chi2-increasing step).
+         * Clamping A to zero would zero all position/width Jacobian entries,
+         * making JtJ rank-2 and triggering the singularity guard. */
+        if (p_new[0] <= 0) {
+            lambda *= 10.0;
+            if (lambda > 1e10) break;
+            continue;
+        }
         /* Center must stay inside the crop */
         if (p_new[1] < 0) p_new[1] = 0;
         if (p_new[1] > nz - 1) p_new[1] = nz - 1;
