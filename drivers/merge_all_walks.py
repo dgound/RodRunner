@@ -5,9 +5,15 @@ Valid = localized at every timepoint (the full-coverage set). A walk with a
 missing timepoint is excluded, since the gap breaks any per-walk trace or
 distance analysis.
 
-Quality filtering is NOT baked in. The movement/repeatability result and the
-fit/mask suspect flags travel as columns, so any subset can be cut from this
-one file without going back to the per-Location outputs.
+Produces two output files with identical columns:
+
+  1. **Full file** — every full-coverage walk, with trace-salvage columns.
+  2. **Analysis set** — the subset passing movement QC with no unresolved
+     doublets (``passes_movement == 1 & TraceSalvagedMultiSpot == 0``).
+
+Trace salvage runs by default when ``--trace_salvage`` is set (always set
+by ``pipeline.py``). Without it, ``TraceSalvagedMultiSpot`` mirrors
+``MultiSpot`` so both files still carry the same columns.
 
   WalkID    continuous 1..N across all Locations (Location order, then
             first-appearance order within a Location)
@@ -15,8 +21,10 @@ one file without going back to the per-Location outputs.
   Location  source Location
 
   passes_movement  1 if the walk cleared the movement filter as configured
-  movement_nm      its displacement (present once drift_correct has been
-                   re-run with the column-writing version)
+
+  TraceSalvagedMultiSpot  0 if no unresolved doublet loci remain after
+                          trace salvage; mirrors MultiSpot when salvage
+                          is skipped
 
   ReplicatingComplexID
             1..N for Replicating==1 walks in this output CSV, ordered by the
@@ -25,16 +33,6 @@ one file without going back to the per-Location outputs.
             positive IDs remain contiguous.
 
 Row unit is (walk, timepoint), matching the source CSVs.
-
-Also writes the subset with the suspect flags and the movement filter applied.
-
-Optional trace salvage
-----------------------
-``--trace_salvage`` runs the conservative, dataset-level trace resolver after
-the ordinary merged files have been written.  It is deliberately OFF by
-default: the resolver needs all locations at once for leave-one-location-out
-calibration and writes separate ``*_trace_salvaged*`` audit products.  It
-never replaces or edits the source replication-QC or drift-corrected CSVs.
 """
 import argparse
 import json
@@ -43,14 +41,17 @@ import pathlib
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+_PIPELINE_DIR = os.path.join(_REPO_ROOT, "pipeline")
+for _p in (_REPO_ROOT, _PIPELINE_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from pipeline import center_ownership as _own
-from pipeline.replicating_complex_ids import annotate_dataframe_complex_ids
+import center_ownership as _own
+from replicating_complex_ids import annotate_dataframe_complex_ids
 
 BASE_DEFAULT = "/mnt/altnas/work/dimos/Salmo_WF/third_replicate_outputs"
 OUT_DEFAULT = "/mnt/altnas/work/dimos/Salmo_WF/third_replicate_merged"
@@ -444,7 +445,7 @@ def _run_trace_salvage(args, location_dirs, settings):
             tmp_path.unlink()
 
     try:
-        from pipeline.trace_salvage import (
+        from trace_salvage import (
             apply_policy, load_config, run_dataset,
         )
     except ImportError as exc:
@@ -633,10 +634,105 @@ def main():
     allw = allw[[c for c in allw.columns if c not in tail] + tail]
     allw = annotate_dataframe_complex_ids(allw)
 
+    # -- Trace salvage: join walk-level columns into the merge frame ----------
+    _TRACE_WALK_COLUMNS = [
+        'TraceSalvagedMultiSpot',
+        'TraceSalvageStatus',
+        'TraceSalvagedLociCount',
+        'TraceRawDoubletLociCount',
+        'TraceUnresolvedDoubletLociCount',
+        'TraceSalvageEligibleLociCount',
+        'TraceSalvagedSingleSpotComplete',
+    ]
+
+    if args.trace_salvage:
+        salvage_result = _run_trace_salvage(
+            args, location_dirs, trace_settings)
+        full_schema_path = salvage_result.get('full_schema')
+        if full_schema_path and os.path.isfile(str(full_schema_path)):
+            salvage_df = pd.read_csv(
+                str(full_schema_path),
+                usecols=['WalkID'] + _TRACE_WALK_COLUMNS,
+                low_memory=False)
+            salvage_walk = (salvage_df
+                            .groupby('WalkID')[_TRACE_WALK_COLUMNS]
+                            .first()
+                            .reset_index())
+            rows_before = len(allw)
+            allw = allw.merge(salvage_walk, on='WalkID',
+                              how='left', validate='many_to_one')
+            assert len(allw) == rows_before, (
+                f'salvage join changed row count {rows_before} -> {len(allw)}')
+            n_missing = int(allw['TraceSalvagedMultiSpot'].isna().sum())
+            if n_missing:
+                print(f'  [salvage] {n_missing} rows have no salvage data; '
+                      f'falling back to MultiSpot')
+                allw['TraceSalvagedMultiSpot'] = (
+                    allw['TraceSalvagedMultiSpot']
+                    .fillna(allw['MultiSpot']).astype(int))
+                for col in _TRACE_WALK_COLUMNS:
+                    if col != 'TraceSalvagedMultiSpot':
+                        allw[col] = allw[col].fillna('')
+            print(f'  [salvage] joined {len(_TRACE_WALK_COLUMNS)} '
+                  f'walk-level columns into merge frame')
+        else:
+            print('  [salvage] WARNING: full_schema not found, '
+                  'falling back to MultiSpot')
+            allw['TraceSalvagedMultiSpot'] = allw['MultiSpot']
+            for col in _TRACE_WALK_COLUMNS:
+                if col not in allw.columns:
+                    allw[col] = ''
+    else:
+        allw['TraceSalvagedMultiSpot'] = allw['MultiSpot']
+        for col in _TRACE_WALK_COLUMNS:
+            if col not in allw.columns:
+                allw[col] = ''
+
+    # -- Trace MAD outlier: flag walks with outlier TP positions ---------------
+    _MAD_K = 3.0
+    tp_centroids = (allw.groupby(['WalkID', 'tp'])[['x_nm', 'y_nm', 'z_nm']]
+                    .mean())
+    walk_medians = tp_centroids.groupby('WalkID').median()
+    dev = tp_centroids.subtract(walk_medians, level='WalkID')
+    dists = np.sqrt((dev ** 2).sum(axis=1))
+    walk_max_dev = dists.groupby('WalkID').max()
+
+    eligible = allw.groupby('WalkID')[['passes_movement',
+                                       'TraceSalvagedMultiSpot']].first()
+    eligible_mask = ((eligible['passes_movement'] == 1)
+                     & (eligible['TraceSalvagedMultiSpot'] == 0))
+    eligible_vals = walk_max_dev[eligible_mask].values
+    med_dev = float(np.median(eligible_vals))
+    mad_dev = float(np.median(np.abs(eligible_vals - med_dev)))
+    mad_sigma = 1.4826 * mad_dev
+    threshold = med_dev + _MAD_K * mad_sigma if mad_sigma > 0 else np.inf
+    walk_outlier = (walk_max_dev > threshold).astype(int)
+
+    mad_df = pd.DataFrame({
+        'trace_max_tp_deviation_nm': walk_max_dev,
+        'trace_mad_outlier': walk_outlier,
+    })
+    rows_before = len(allw)
+    allw = allw.merge(mad_df, on='WalkID', how='left')
+    assert len(allw) == rows_before
+
+    n_outlier = int(walk_outlier[eligible_mask].sum())
+    n_eligible = int(eligible_mask.sum())
+    print(f'\n  [MAD outlier] metric=max TP centroid deviation from '
+          f'walk median (nm)')
+    print(f'  [MAD outlier] population={n_eligible} walks '
+          f'(passes_movement & !MultiSpot)')
+    print(f'  [MAD outlier] median={med_dev:.1f} nm, '
+          f'MAD-sigma={mad_sigma:.1f} nm, '
+          f'threshold (k={_MAD_K})={threshold:.1f} nm')
+    print(f'  [MAD outlier] flagged={n_outlier}/{n_eligible} '
+          f'({100*n_outlier/n_eligible:.1f}%)')
+
+    # -- Write full file ------------------------------------------------------
     out = os.path.join(args.outdir, args.out_name)
     allw.to_csv(out, index=False)
 
-    print(f"{'Location':<14}{'valid walks':>13}{'passes movement':>17}")
+    print(f"\n{'Location':<14}{'valid walks':>13}{'passes movement':>17}")
     for loc, a, m in summary:
         print(f"{loc:<14}{a:>13}{m:>17}")
     print("-" * 44)
@@ -651,24 +747,16 @@ def main():
     _report_ownership(allw, ownership_sources)
     print(f"  {os.path.getsize(out)/1e6:.0f} MB")
 
-    need = {"PinnedDoubleFitSuspect", "MergedMaskSuspect", "passes_movement"}
-    missing = sorted(need - set(allw.columns))
-    if missing:
-        print(f"\n[!] cannot cut the filtered subset, missing: {missing}")
-    else:
-        sub = allw[(allw.PinnedDoubleFitSuspect == 0)
-                   & (allw.MergedMaskSuspect == 0)
-                   & (allw.passes_movement == 1)]
-        sub = annotate_dataframe_complex_ids(sub)
-        sub_path = os.path.join(args.outdir, args.clean_name)
-        sub.to_csv(sub_path, index=False)
-        print(f"\n{args.clean_name}")
-        print("  no fit-pinned suspect, no fused-mask suspect, passes movement")
-        print(f"  rows={len(sub)}  walks={sub.WalkID.nunique()}"
-              f"  {os.path.getsize(sub_path)/1e6:.0f} MB")
-
-    if args.trace_salvage:
-        _run_trace_salvage(args, location_dirs, trace_settings)
+    # -- Write analysis set (filtered file) -----------------------------------
+    sub = allw[(allw.passes_movement == 1)
+               & (allw.TraceSalvagedMultiSpot == 0)]
+    sub = annotate_dataframe_complex_ids(sub)
+    sub_path = os.path.join(args.outdir, args.clean_name)
+    sub.to_csv(sub_path, index=False)
+    print(f"\n{args.clean_name}")
+    print(f"  passes_movement=1, TraceSalvagedMultiSpot=0")
+    print(f"  rows={len(sub)}  walks={sub.WalkID.nunique()}"
+          f"  {os.path.getsize(sub_path)/1e6:.0f} MB")
 
 
 if __name__ == "__main__":

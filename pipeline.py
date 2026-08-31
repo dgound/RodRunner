@@ -3,7 +3,7 @@
 
 Runs the complete oligoSTORM widefield pipeline from raw input through
 segmentation, localization, replication QC, drift correction, classification,
-and dataset-level merge with optional trace salvage.
+and dataset-level merge with trace salvage.
 
 Usage:
     python pipeline.py --input /path/to/raw --output /path/to/results
@@ -124,8 +124,9 @@ def parse_args(argv=None):
     merge = p.add_argument_group('merge and salvage')
     merge.add_argument('--no-merge', action='store_true',
                        help='Skip dataset-level merge after all locations')
-    merge.add_argument('--salvage', action='store_true',
-                       help='Run trace salvage during merge')
+    merge.add_argument('--no-salvage', action='store_true',
+                       help='Skip trace salvage during merge '
+                            '(salvage runs by default)')
     merge.add_argument('--dataset-id', default=None,
                        help='Dataset identity for merge outputs '
                             '(default: output directory name)')
@@ -416,7 +417,12 @@ def run_merge(args, output_dir, env):
         '--location_prefix', loc_prefix,
     ]
 
-    if args.salvage:
+    n_locations = sum(
+        1 for d in Path(output_dir).iterdir()
+        if d.is_dir() and d.name.startswith(loc_prefix))
+    run_salvage = not args.no_salvage and n_locations >= 2
+
+    if run_salvage:
         chromosome_order = ','.join(
             str(i) for i in range(args.replication_tp_start,
                                   args.replication_tp_end + 1))
@@ -439,8 +445,11 @@ def run_merge(args, output_dir, env):
             '--trace_salvage_z_step_nm', str(args.z_step_nm),
             '--trace_salvage_expected_locations', str(loc_list),
         ]
+    elif not args.no_salvage and n_locations < 2:
+        print('  [salvage] skipped: need >= 2 locations for '
+              'leave-one-location-out calibration')
 
-    label = 'Merge' + (' + salvage' if args.salvage else '')
+    label = 'Merge + salvage' if run_salvage else 'Merge'
     run_step(label, cmd, env)
 
 
