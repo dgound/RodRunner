@@ -109,6 +109,12 @@ def parse_args(argv=None):
     layout.add_argument('--replication-tp-end', type=int, default=21,
                         help='Last genomic locus TP index, 0-based (default: 21)')
 
+    drift = p.add_argument_group('drift correction')
+    drift.add_argument('--drift-xy-method',
+                       choices=('rod_registration', 'centroid'),
+                       default='rod_registration',
+                       help='XY drift estimation method (default: rod_registration)')
+
     mov = p.add_argument_group('movement QC')
     mov.add_argument('--movement-policy',
                      choices=('xy_repeatability', 'xyz_repeatability_legacy',
@@ -252,6 +258,7 @@ def process_location(loc, args, work, env):
         raw = str(Path(args.input) / loc / 'Raw Images')
         src_args = ['--source', 'dat', '--input_dir', raw]
     else:
+        raw = str(work / 'probe_1')
         src_args = ['--source', 'tiff']
 
     chrom_args = ['--chromatic-registration', args.chromatic_registration]
@@ -360,6 +367,10 @@ def process_location(loc, args, work, env):
         '--xy_pixel_nm', str(args.xy_pixel_nm),
         '--z_step_nm', str(args.z_step_nm),
         '--fov_size', str(args.fov_size),
+        '--drift_xy_method', args.drift_xy_method,
+        '--raw_dir', raw,
+        '--mask_path', mask,
+        '--source_fmt', args.source,
     ]
     if args.movement_policy != 'disabled':
         axes = 'xyz' if args.movement_policy == 'xyz_repeatability_legacy' else 'xy'

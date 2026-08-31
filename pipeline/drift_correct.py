@@ -936,7 +936,27 @@ def _parse_args() -> argparse.Namespace:
                         f'exclude edge fiducials, so a value smaller than the '
                         f'real field silently drops every fiducial in the outer '
                         f'band and biases drift to one corner.')
+    p.add_argument('--drift_xy_method',
+                   choices=('rod_registration', 'centroid'),
+                   default='rod_registration',
+                   help='XY drift estimation method. "rod_registration" (default) '
+                        'uses per-cell phase correlation of 488 MIPs — lower '
+                        'noise, no centroid bias. "centroid" uses the legacy '
+                        'Gaussian-centroid fiducial approach.')
+    p.add_argument('--raw_dir', type=str, default=None,
+                   help='Path to raw data directory (Raw Images/ for dat). '
+                        'Required when --drift_xy_method=rod_registration.')
+    p.add_argument('--mask_path', type=str, default=None,
+                   help='Path to cellpose masks_final.tif. '
+                        'Required when --drift_xy_method=rod_registration.')
+    p.add_argument('--source_fmt', choices=('dat', 'tiff'), default='dat',
+                   help='Raw data format (default: dat).')
     args = p.parse_args()
+    if args.drift_xy_method == 'rod_registration':
+        if not args.raw_dir:
+            p.error('--raw_dir is required with --drift_xy_method=rod_registration')
+        if not args.mask_path:
+            p.error('--mask_path is required with --drift_xy_method=rod_registration')
     if args.movement_tp_to_1based < args.movement_tp_from_1based:
         p.error(f'--movement_tp_to_1based ({args.movement_tp_to_1based}) '
                 f'must be >= --movement_tp_from_1based '
@@ -1001,7 +1021,16 @@ def main():
     print(f'Reference TP: {ref_tp}')
     print(f'Intersection of 488/640 TPs: {len(all_tps)}')
 
-    # ---- Fiducials ----
+    # ---- XY drift estimation ----
+    use_rod = args.drift_xy_method == 'rod_registration'
+
+    if use_rod:
+        from rod_drift import estimate_xy_drift
+        print(f'\n[Rod registration] Estimating XY drift from 488 MIPs...')
+        rod_xy, rod_stats, rod_ref = estimate_xy_drift(
+            args.raw_dir, args.mask_path, fmt=args.source_fmt)
+
+    # ---- Fiducials (always needed for Z; also for XY when centroid) ----
     fiducials_initial = select_fiducials(
         pos_488, all_tps, ref_tp,
         n_fiducials=N_FIDUCIALS, edge_pad=EDGE_PAD, fov_size=FOV_SIZE)
@@ -1014,27 +1043,24 @@ def main():
         mad_k=MAD_K, min_kept=MIN_KEPT_ROIS, use_err_weights=USE_FIT_ERR_WEIGHTS)
 
     # ---- Compute stability metrics from pass-1 residuals ----
-    # We deliberately pass drift_raw_p1 (the unsmoothed per-TP robust estimate)
-    # rather than any smoothed drift. Smoothing would propagate signal between
-    # TPs and inflate per-TP residuals, which would bias the stability scores
-    # against ROIs that happen to be far from the spline on a noisy TP.
     print('\n[Stability scoring] Computing per-ROI metrics from pass-1 residuals...')
     roi_metrics = compute_roi_stability_metrics(
         per_roi_p1, drift_raw_p1, all_tps, fiducials_initial)
 
-    # ---- Stability filtering — DECOUPLED per axis group ----
-    # An ROI that is noisy only in Z can still be XY-stable (and vice versa).
-    # We build two separate stable pools and run pass-2 twice.
+    # ---- Stability filtering ----
     tp_cov_min = args.tp_coverage
-    stable_xy, breakdown_xy = filter_stable_rois(
-        roi_metrics, axis_group='xy',
-        tp_cov_min=tp_cov_min,
-        outlier_frac_max=STABLE_OUTLIER_FRAC_MAX,
-        med_nm=STABLE_MED_ABS_RES_XY_NM,
-        mad_nm=STABLE_MAD_RES_XY_NM,
-        min_stable=STABLE_MIN_FIDUCIALS,
-        relax_factor=STABLE_RELAX_FACTOR,
-    )
+
+    if not use_rod:
+        stable_xy, breakdown_xy = filter_stable_rois(
+            roi_metrics, axis_group='xy',
+            tp_cov_min=tp_cov_min,
+            outlier_frac_max=STABLE_OUTLIER_FRAC_MAX,
+            med_nm=STABLE_MED_ABS_RES_XY_NM,
+            mad_nm=STABLE_MAD_RES_XY_NM,
+            min_stable=STABLE_MIN_FIDUCIALS,
+            relax_factor=STABLE_RELAX_FACTOR,
+        )
+
     stable_z, breakdown_z = filter_stable_rois(
         roi_metrics, axis_group='z',
         tp_cov_min=tp_cov_min,
@@ -1045,51 +1071,75 @@ def main():
         relax_factor=STABLE_RELAX_FACTOR,
     )
 
-    unstable_xy = fiducials_initial - stable_xy
-    unstable_z  = fiducials_initial - stable_z
+    if not use_rod:
+        unstable_xy = fiducials_initial - stable_xy
+        print(f'  Stable XY ROIs: {len(stable_xy)} / {len(fiducials_initial)} sampled  '
+              f'(tp_cov_min={tp_cov_min:.2f})')
+        print(f'  Rejection breakdown (XY, sequential):')
+        for crit, n_rej in breakdown_xy.items():
+            print(f'    {crit}: {n_rej} removed')
 
-    print(f'  Stable XY ROIs: {len(stable_xy)} / {len(fiducials_initial)} sampled  '
-          f'(tp_cov_min={tp_cov_min:.2f})')
-    print(f'  Rejection breakdown (XY, sequential):')
-    for crit, n_rej in breakdown_xy.items():
-        print(f'    {crit}: {n_rej} removed')
+    unstable_z  = fiducials_initial - stable_z
     print(f'  Stable Z  ROIs: {len(stable_z)} / {len(fiducials_initial)} sampled')
     print(f'  Rejection breakdown (Z, sequential):')
     for crit, n_rej in breakdown_z.items():
         print(f'    {crit}: {n_rej} removed')
 
-    overlap = len(stable_xy & stable_z)
-    print(f'  Overlap XY ∩ Z: {overlap} ROIs  '
-          f'(XY-only: {len(stable_xy - stable_z)}, '
-          f'Z-only: {len(stable_z - stable_xy)})')
-
-    # ---- Pass 2a: XY drift estimate using XY-stable fiducials ----
-    print(f'\n[Pass 2a / XY] Estimating drift with {len(stable_xy)} XY-stable fiducials...')
-    drift_raw_xy, n_kept_xy, spread_xy, per_roi_xy, keep_xy = estimate_drift_pass(
-        pos_488, stable_xy, all_tps, ref_tp,
-        mad_k=MAD_K, min_kept=MIN_KEPT_ROIS, use_err_weights=USE_FIT_ERR_WEIGHTS)
+    if not use_rod:
+        overlap = len(stable_xy & stable_z)
+        print(f'  Overlap XY ∩ Z: {overlap} ROIs  '
+              f'(XY-only: {len(stable_xy - stable_z)}, '
+              f'Z-only: {len(stable_z - stable_xy)})')
 
     # ---- Pass 2b: Z drift estimate using Z-stable fiducials ----
-    print(f'[Pass 2b / Z ] Estimating drift with {len(stable_z)} Z-stable fiducials...')
+    print(f'\n[Pass 2 / Z] Estimating drift with {len(stable_z)} Z-stable fiducials...')
     drift_raw_z, n_kept_z, spread_z, per_roi_z, keep_z_mask = estimate_drift_pass(
         pos_488, stable_z, all_tps, ref_tp,
         mad_k=MAD_K, min_kept=MIN_KEPT_ROIS, use_err_weights=USE_FIT_ERR_WEIGHTS)
 
-    # ---- Combine: drift_raw is per-axis from its own pool ----
-    drift_raw = {
-        tp: (drift_raw_z[tp][AXIS_Z], drift_raw_xy[tp][AXIS_Y], drift_raw_xy[tp][AXIS_X])
-        for tp in all_tps
-    }
-    # n_kept / spread for QC are per axis, but each axis's values come from
-    # its own pass. We build a composite (z_z, y_xy, x_xy) for each TP.
-    n_kept = {
-        tp: (n_kept_z[tp][AXIS_Z], n_kept_xy[tp][AXIS_Y], n_kept_xy[tp][AXIS_X])
-        for tp in all_tps
-    }
-    spread = {
-        tp: (spread_z[tp][AXIS_Z], spread_xy[tp][AXIS_Y], spread_xy[tp][AXIS_X])
-        for tp in all_tps
-    }
+    if use_rod:
+        # XY from rod registration, Z from centroid fiducials
+        stable_xy = fiducials_initial
+        unstable_xy = set()
+        breakdown_xy = {'rod_registration': 0}
+        drift_raw = {}
+        n_kept = {}
+        spread = {}
+        for tp in all_tps:
+            dy, dx = rod_xy.get(tp, (0.0, 0.0))
+            # Phase correlation returns shift-to-align (negative of displacement).
+            # Centroid convention is displacement (pos[tp] - pos[ref]).
+            dy, dx = -dy, -dx
+            st = rod_stats.get(tp, {'n_kept': 0, 'mad_sigma_y': 0.0,
+                                    'mad_sigma_x': 0.0})
+            drift_raw[tp] = (drift_raw_z[tp][AXIS_Z], dy, dx)
+            n_kept[tp] = (n_kept_z[tp][AXIS_Z],
+                          st['n_kept'], st['n_kept'])
+            spread[tp] = (spread_z[tp][AXIS_Z],
+                          st['mad_sigma_y'], st['mad_sigma_x'])
+        per_roi_xy = per_roi_z
+        keep_xy = keep_z_mask
+    else:
+        # XY from centroid fiducials
+        print(f'\n[Pass 2 / XY] Estimating drift with {len(stable_xy)} XY-stable fiducials...')
+        drift_raw_xy, n_kept_xy, spread_xy, per_roi_xy, keep_xy = estimate_drift_pass(
+            pos_488, stable_xy, all_tps, ref_tp,
+            mad_k=MAD_K, min_kept=MIN_KEPT_ROIS, use_err_weights=USE_FIT_ERR_WEIGHTS)
+        drift_raw = {
+            tp: (drift_raw_z[tp][AXIS_Z], drift_raw_xy[tp][AXIS_Y],
+                 drift_raw_xy[tp][AXIS_X])
+            for tp in all_tps
+        }
+        n_kept = {
+            tp: (n_kept_z[tp][AXIS_Z], n_kept_xy[tp][AXIS_Y],
+                 n_kept_xy[tp][AXIS_X])
+            for tp in all_tps
+        }
+        spread = {
+            tp: (spread_z[tp][AXIS_Z], spread_xy[tp][AXIS_Y],
+                 spread_xy[tp][AXIS_X])
+            for tp in all_tps
+        }
 
     # ---- Low-confidence flagging ----
     low_conf = flag_low_confidence(
