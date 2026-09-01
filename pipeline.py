@@ -67,8 +67,8 @@ def parse_args(argv=None):
                       help='Axial step size in nm (auto-detected from data.json)')
     geom.add_argument('--fov-size', type=int, default=None,
                       help='FOV size in pixels, assumed square (auto-detected from data.json)')
-    geom.add_argument('--sigma-z-max', type=float, default=3.5,
-                      help='Axial sigma cap in voxels, 0 = uncapped (default: 3.5)')
+    geom.add_argument('--sigma-z-max', type=float, default=0,
+                      help='Axial sigma cap in voxels, 0 = uncapped (default: 0)')
 
     seg = p.add_argument_group('segmentation')
     seg.add_argument('--segmentation',
