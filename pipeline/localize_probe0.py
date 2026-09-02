@@ -42,9 +42,9 @@ _ap = _argparse.ArgumentParser(description='Localize probe_0 (640nm).')
 _ap.add_argument('--sigma_z_max', type=float, default=0.0,
                  help='Upper cap on fitted sigma_z in voxels (<=0 disables; '
                       'default 0.0 preserves original behaviour).')
-_ap.add_argument('--min_snr', type=float, default=0.0,
-                 help='Minimum amplitude/background ratio to accept a fit. '
-                      'Spots below this SNR are treated as failed fits. '
+_ap.add_argument('--min_sbr', type=float, default=0.0,
+                 help='Minimum signal-to-background ratio (amplitude/background) '
+                      'to accept a fit. Spots below this are treated as failed. '
                       '0 disables (default).')
 _ap.add_argument('--source', choices=['tiff', 'dat'], default='tiff',
                  help="Image source: per-TP TIFFs (default) or raw Vutara .dat.")
@@ -379,7 +379,7 @@ boundary_accepted = 0
 
 total_fit = 0
 total_fail = 0
-n_snr_rejected = 0
+n_sbr_rejected = 0
 
 with open(out_csv, 'w', newline='') as csvfile:
     writer = csv.DictWriter(csvfile, fieldnames=fields)
@@ -455,10 +455,10 @@ with open(out_csv, 'w', newline='') as csvfile:
                 unevaluable_reason[c] = f'fit_failed:{int(success[c])}'
                 continue
             r = results[c]
-            if _args.min_snr > 0 and r[7] > 0 and r[0] / r[7] < _args.min_snr:
+            if _args.min_sbr > 0 and r[7] > 0 and r[0] / r[7] < _args.min_sbr:
                 success[c] = -4
-                unevaluable_reason[c] = f'snr_below_threshold:{r[0]/r[7]:.3f}'
-                n_snr_rejected += 1
+                unevaluable_reason[c] = f'sbr_below_threshold:{r[0]/r[7]:.3f}'
+                n_sbr_rejected += 1
                 continue
             cat = _own.classify_center(fit_masks, c, r[1], r[2], r[3])
             initial[c] = cat
@@ -617,7 +617,7 @@ with open(out_csv, 'w', newline='') as csvfile:
         print(f'  Fit: {n_ok}, Failed: {n_bad}')
 
 print(f'\nTotal: {total_fit} localizations, {total_fail} failed'
-      + (f', {n_snr_rejected} SNR-rejected (amp/bg < {_args.min_snr})' if n_snr_rejected else ''))
+      + (f', {n_sbr_rejected} SBR-rejected (amp/bg < {_args.min_sbr})' if n_sbr_rejected else ''))
 _own_total = sum(ownership_counts.values())
 if _own_total:
     print(f'Centre ownership over {_own_total} successful fits '
