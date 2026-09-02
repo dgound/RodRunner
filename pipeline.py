@@ -69,8 +69,8 @@ def parse_args(argv=None):
                       help='FOV size in pixels, assumed square (auto-detected from data.json)')
     geom.add_argument('--sigma-z-max', type=float, default=0,
                       help='Axial sigma cap in voxels, 0 = uncapped (default: 0)')
-    geom.add_argument('--min-snr', type=float, default=0.25,
-                      help='Minimum amplitude/background to accept a fit, 0 = off (default: 0.25)')
+    geom.add_argument('--min-snr', type=float, default=0,
+                      help='Minimum amplitude/background to accept a fit, 0 = off (default: 0)')
 
     seg = p.add_argument_group('segmentation')
     seg.add_argument('--segmentation',

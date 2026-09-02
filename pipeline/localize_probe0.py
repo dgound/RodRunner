@@ -42,10 +42,10 @@ _ap = _argparse.ArgumentParser(description='Localize probe_0 (640nm).')
 _ap.add_argument('--sigma_z_max', type=float, default=0.0,
                  help='Upper cap on fitted sigma_z in voxels (<=0 disables; '
                       'default 0.0 preserves original behaviour).')
-_ap.add_argument('--min_snr', type=float, default=0.25,
+_ap.add_argument('--min_snr', type=float, default=0.0,
                  help='Minimum amplitude/background ratio to accept a fit. '
                       'Spots below this SNR are treated as failed fits. '
-                      '0 disables. Default: 0.25.')
+                      '0 disables (default).')
 _ap.add_argument('--source', choices=['tiff', 'dat'], default='tiff',
                  help="Image source: per-TP TIFFs (default) or raw Vutara .dat.")
 _ap.add_argument('--input_dir', default=None,

@@ -25,6 +25,7 @@
 #endif
 
 #define NPAR 8
+#define NPAR_SPLIT 9
 #define MAX_ITER 100
 
 /* Ascending-order comparator for qsort<double>. */
@@ -65,6 +66,201 @@ static inline double model(double z, double y, double x, const double *p) {
     double dz = z - p[1], dy = y - p[2], dx = x - p[3];
     double sz2 = p[4]*p[4], sy2 = p[5]*p[5], sx2 = p[6]*p[6];
     return p[0] * exp(-0.5*(dz*dz/sz2 + dy*dy/sy2 + dx*dx/sx2)) + p[7];
+}
+
+/* Split-Gaussian model: params = [A, z0, y0, x0, sz_left, sz_right, sy, sx, bg]
+ * sz_left applies when z < z0, sz_right when z >= z0. */
+static inline double model_split(double z, double y, double x, const double *p) {
+    double dz = z - p[1], dy = y - p[2], dx = x - p[3];
+    double sz = (dz < 0) ? p[4] : p[5];
+    double sz2 = sz*sz, sy2 = p[6]*p[6], sx2 = p[7]*p[7];
+    return p[0] * exp(-0.5*(dz*dz/sz2 + dy*dy/sy2 + dx*dx/sx2)) + p[8];
+}
+
+/* Jacobian for the split model (9 parameters). */
+static inline void jacobian_split(double z, double y, double x, const double *p,
+                                   double e, double *J) {
+    double dz = z - p[1], dy = y - p[2], dx = x - p[3];
+    int left = (dz < 0);
+    double sz = left ? p[4] : p[5];
+    double sz2 = sz*sz, sy2 = p[6]*p[6], sx2 = p[7]*p[7];
+    J[0] = e;                                /* dF/dA */
+    J[1] = p[0] * e * dz / sz2;             /* dF/dz0 */
+    J[2] = p[0] * e * dy / sy2;             /* dF/dy0 */
+    J[3] = p[0] * e * dx / sx2;             /* dF/dx0 */
+    J[4] = left ? p[0]*e*dz*dz/(p[4]*sz2) : 0.0;  /* dF/dsz_left */
+    J[5] = left ? 0.0 : p[0]*e*dz*dz/(p[5]*sz2);  /* dF/dsz_right */
+    J[6] = p[0] * e * dy*dy / (p[6]*sy2);   /* dF/dsy */
+    J[7] = p[0] * e * dx*dx / (p[7]*sx2);   /* dF/dsx */
+    J[8] = 1.0;                              /* dF/dbg */
+}
+
+/* Refit with split-Gaussian in Z. Seeded from the symmetric fit result.
+ * Overwrites z0 and sz in params_out if the split fit improves chi2. */
+static void refit_split_z(const double *data, const unsigned char *mask,
+                          int nz, int ny, int nx, double *params_out) {
+    /* Count masked pixels */
+    int n = nz * ny * nx;
+    int npix = 0;
+    for (int i = 0; i < n; i++) if (mask[i]) npix++;
+    if (npix < NPAR_SPLIT + 1) return;
+
+    /* Seed from symmetric result: [A, z0, y0, x0, sz_left, sz_right, sy, sx, bg] */
+    double p[NPAR_SPLIT] = {
+        params_out[0], params_out[1], params_out[2], params_out[3],
+        params_out[4], params_out[4],  /* sz_left = sz_right = sz */
+        params_out[5], params_out[6], params_out[7]
+    };
+
+    /* Compute chi2 of the symmetric fit for comparison */
+    double chi2_sym = 0;
+    for (int iz = 0; iz < nz; iz++)
+        for (int iy = 0; iy < ny; iy++)
+            for (int ix = 0; ix < nx; ix++) {
+                if (!mask[iz*ny*nx + iy*nx + ix]) continue;
+                double f = model((double)iz, (double)iy, (double)ix, params_out);
+                double r = data[iz*ny*nx + iy*nx + ix] - f;
+                chi2_sym += r * r;
+            }
+
+    double lambda = 0.001;
+    double JtJ[NPAR_SPLIT*NPAR_SPLIT], Jtr[NPAR_SPLIT], J[NPAR_SPLIT];
+
+    for (int iter = 0; iter < MAX_ITER; iter++) {
+        memset(JtJ, 0, sizeof(JtJ));
+        memset(Jtr, 0, sizeof(Jtr));
+        double chi2 = 0;
+
+        for (int iz = 0; iz < nz; iz++)
+            for (int iy = 0; iy < ny; iy++)
+                for (int ix = 0; ix < nx; ix++) {
+                    int idx = iz*ny*nx + iy*nx + ix;
+                    if (!mask[idx]) continue;
+                    double d = data[idx];
+                    double z = (double)iz, y = (double)iy, x = (double)ix;
+                    double f = model_split(z, y, x, p);
+                    double e = f - p[8]; /* A*exp(...) = f - bg */
+                    if (p[0] > 0) e /= p[0]; else e = 0;
+                    double r = d - f;
+                    chi2 += r * r;
+                    jacobian_split(z, y, x, p, e, J);
+                    for (int a = 0; a < NPAR_SPLIT; a++) {
+                        Jtr[a] += J[a] * r;
+                        for (int b = 0; b < NPAR_SPLIT; b++)
+                            JtJ[a*NPAR_SPLIT+b] += J[a] * J[b];
+                    }
+                }
+
+        /* Damped normal equations */
+        double A[NPAR_SPLIT*NPAR_SPLIT], b[NPAR_SPLIT];
+        memcpy(A, JtJ, sizeof(A));
+        memcpy(b, Jtr, sizeof(b));
+        for (int i = 0; i < NPAR_SPLIT; i++)
+            A[i*NPAR_SPLIT+i] *= (1.0 + lambda);
+
+        /* Solve via Gaussian elimination */
+        double aug[NPAR_SPLIT][NPAR_SPLIT+1];
+        for (int i = 0; i < NPAR_SPLIT; i++) {
+            for (int j = 0; j < NPAR_SPLIT; j++)
+                aug[i][j] = A[i*NPAR_SPLIT+j];
+            aug[i][NPAR_SPLIT] = b[i];
+        }
+        int singular = 0;
+        for (int col = 0; col < NPAR_SPLIT; col++) {
+            int maxrow = col;
+            for (int row = col+1; row < NPAR_SPLIT; row++)
+                if (fabs(aug[row][col]) > fabs(aug[maxrow][col]))
+                    maxrow = row;
+            if (maxrow != col) {
+                double tmp[NPAR_SPLIT+1];
+                memcpy(tmp, aug[col], sizeof(tmp));
+                memcpy(aug[col], aug[maxrow], sizeof(tmp));
+                memcpy(aug[maxrow], tmp, sizeof(tmp));
+            }
+            if (fabs(aug[col][col]) < 1e-15) { singular = 1; break; }
+            for (int row = col+1; row < NPAR_SPLIT; row++) {
+                double f = aug[row][col] / aug[col][col];
+                for (int j = col; j <= NPAR_SPLIT; j++)
+                    aug[row][j] -= f * aug[col][j];
+            }
+        }
+        if (singular) break;
+
+        double dp[NPAR_SPLIT];
+        for (int i = NPAR_SPLIT-1; i >= 0; i--) {
+            dp[i] = aug[i][NPAR_SPLIT];
+            for (int j = i+1; j < NPAR_SPLIT; j++)
+                dp[i] -= aug[i][j] * dp[j];
+            dp[i] /= aug[i][i];
+        }
+
+        double p_new[NPAR_SPLIT];
+        for (int i = 0; i < NPAR_SPLIT; i++)
+            p_new[i] = p[i] + dp[i];
+
+        /* Bounds */
+        if (p_new[0] <= 0) { lambda *= 10; if (lambda > 1e10) break; continue; }
+        if (p_new[1] < 0) p_new[1] = 0;
+        if (p_new[1] > nz-1) p_new[1] = nz-1;
+        if (p_new[2] < 0) p_new[2] = 0;
+        if (p_new[2] > ny-1) p_new[2] = ny-1;
+        if (p_new[3] < 0) p_new[3] = 0;
+        if (p_new[3] > nx-1) p_new[3] = nx-1;
+        if (p_new[4] < 0.2) p_new[4] = 0.2;
+        if (p_new[5] < 0.2) p_new[5] = 0.2;
+        double sz_hi = (g_sigma_z_max > 0) ? g_sigma_z_max : (double)nz;
+        if (p_new[4] > sz_hi) p_new[4] = sz_hi;
+        if (p_new[5] > sz_hi) p_new[5] = sz_hi;
+        if (p_new[6] < 0.3) p_new[6] = 0.3;
+        if (p_new[6] > ny/2.0) p_new[6] = ny/2.0;
+        if (p_new[7] < 0.3) p_new[7] = 0.3;
+        if (p_new[7] > nx/2.0) p_new[7] = nx/2.0;
+        if (p_new[8] < 0) p_new[8] = 0;
+
+        double chi2_new = 0;
+        for (int iz = 0; iz < nz; iz++)
+            for (int iy = 0; iy < ny; iy++)
+                for (int ix = 0; ix < nx; ix++) {
+                    int idx = iz*ny*nx + iy*nx + ix;
+                    if (!mask[idx]) continue;
+                    double f = model_split((double)iz, (double)iy, (double)ix, p_new);
+                    double r = data[idx] - f;
+                    chi2_new += r * r;
+                }
+
+        if (chi2_new < chi2) {
+            memcpy(p, p_new, sizeof(p));
+            lambda *= 0.1;
+            if (fabs(chi2 - chi2_new) / (chi2 + 1e-30) < 1e-6) break;
+        } else {
+            lambda *= 10;
+            if (lambda > 1e10) break;
+        }
+    }
+
+    /* Compute split chi2 */
+    double chi2_split = 0;
+    for (int iz = 0; iz < nz; iz++)
+        for (int iy = 0; iy < ny; iy++)
+            for (int ix = 0; ix < nx; ix++) {
+                int idx = iz*ny*nx + iy*nx + ix;
+                if (!mask[idx]) continue;
+                double f = model_split((double)iz, (double)iy, (double)ix, p);
+                double r = data[idx] - f;
+                chi2_split += r * r;
+            }
+
+    /* Accept split result only if it improves chi2 */
+    if (chi2_split < chi2_sym) {
+        params_out[0] = p[0];  /* A */
+        params_out[1] = p[1];  /* z0 */
+        params_out[2] = p[2];  /* y0 */
+        params_out[3] = p[3];  /* x0 */
+        params_out[4] = (p[4] < p[5]) ? p[4] : p[5];  /* sz = min(left,right) */
+        params_out[5] = p[6];  /* sy */
+        params_out[6] = p[7];  /* sx */
+        params_out[7] = p[8];  /* bg */
+    }
 }
 
 /*
@@ -379,6 +575,20 @@ int fit_gaussian_3d(const double *data, const unsigned char *mask,
             return -3;
     }
 
+    /* Store symmetric result, then attempt split-Gaussian refit in Z.
+     * The refit overwrites params_out[0..7] only if it improves chi2. */
+    for (int i = 0; i < NPAR; i++)
+        params_out[i] = p[i];
+
+    double sz_threshold = (double)nz / 3.0;
+    int z_near_boundary = (p[1] < p[4]) || (p[1] > nz - 1 - p[4]);
+    if (p[4] > sz_threshold || z_near_boundary)
+        refit_split_z(data, mask, nz, ny, nx, params_out);
+
+    /* Update p from (possibly improved) params_out for error estimation. */
+    for (int i = 0; i < NPAR; i++)
+        p[i] = params_out[i];
+
     /* Compute parameter errors from inverse of JtJ (recompute at final params).
      * Masked voxels only, matching the main LM objective. */
     memset(JtJ, 0, sizeof(JtJ));
@@ -464,9 +674,6 @@ int fit_gaussian_3d(const double *data, const unsigned char *mask,
             params_out[10] = sqrt(fabs(inv[3][NPAR+3] * s2)); /* x_err */
         }
     }
-
-    for (int i = 0; i < NPAR; i++)
-        params_out[i] = p[i];
 
     return ret_code;
 }
