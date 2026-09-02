@@ -69,6 +69,8 @@ def parse_args(argv=None):
                       help='FOV size in pixels, assumed square (auto-detected from data.json)')
     geom.add_argument('--sigma-z-max', type=float, default=0,
                       help='Axial sigma cap in voxels, 0 = uncapped (default: 0)')
+    geom.add_argument('--min-snr', type=float, default=0.25,
+                      help='Minimum amplitude/background to accept a fit, 0 = off (default: 0.25)')
 
     seg = p.add_argument_group('segmentation')
     seg.add_argument('--segmentation',
@@ -297,6 +299,7 @@ def process_location(loc, args, work, env):
     run_step('3. Localize 640', [
         py, os.path.join(pd, 'localize_probe0.py'),
         '--sigma_z_max', str(args.sigma_z_max),
+        '--min_snr', str(args.min_snr),
         '--segmentation-mode', seg,
         '--z-gate-failure-policy', 'quarantine',
         '--center-ownership', args.center_ownership,
@@ -505,7 +508,8 @@ def main(argv=None):
     print(f'input  = {args.input}')
     print(f'output = {output_dir}')
     print(f'geometry: {args.xy_pixel_nm} nm/px, z_step={args.z_step_nm} nm, '
-          f'fov={args.fov_size} px, sigma_z_max={args.sigma_z_max}')
+          f'fov={args.fov_size} px, sigma_z_max={args.sigma_z_max}'
+          f', min_snr={args.min_snr}')
     print(f'gates: amp_ratio>={args.min_amp_ratio}, '
           f'sep>={args.min_spot_sep_nm} nm, '
           f'SE_corr={args.se_correction_factor}x, '
