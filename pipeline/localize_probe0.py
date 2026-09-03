@@ -141,6 +141,18 @@ if lib.has_openmp():
     print(f'Fitter: OpenMP enabled, max threads = {lib.openmp_max_threads()}')
 else:
     print('Fitter: serial (no OpenMP in this .so)')
+_preprocess_lib_path = os.path.join(_HERE, 'preprocess3d.so')
+if os.path.exists(_preprocess_lib_path):
+    _pp = ctypes.CDLL(_preprocess_lib_path)
+    _pp.preprocess_denoise_morpho.restype = None
+    _pp.preprocess_denoise_morpho.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    print('Preprocessing: denoise+morpho enabled (preprocess3d.so)')
+else:
+    _pp = None
+    print('Preprocessing: disabled (preprocess3d.so not found)')
+
 lib.batch_fit.restype = None
 lib.batch_fit.argtypes = [
     ctypes.POINTER(ctypes.c_double),
@@ -392,6 +404,11 @@ with open(out_csv, 'w', newline='') as csvfile:
         print(f'[{tp_idx+1}/{n_tp}] {tp_name}...', flush=True)
 
         img = img.astype(np.float64)
+        if _pp is not None:
+            img = np.ascontiguousarray(img)
+            _pp.preprocess_denoise_morpho(
+                img.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                img.shape[0], img.shape[1], img.shape[2], 20)
         if img.shape != masks.shape:
             raise ValueError(
                 f'Shape mismatch at {tp_name}: img={img.shape} vs mask={masks.shape}. '
