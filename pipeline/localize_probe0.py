@@ -46,6 +46,9 @@ _ap.add_argument('--min_sbr', type=float, default=0.0,
                  help='Minimum signal-to-background ratio (amplitude/background) '
                       'to accept a fit. Spots below this are treated as failed. '
                       '0 disables (default).')
+_ap.add_argument('--no-preprocess', '--no_preprocess', dest='no_preprocess',
+                 action='store_true',
+                 help='Disable image preprocessing before fitting.')
 _ap.add_argument('--source', choices=['tiff', 'dat'], default='tiff',
                  help="Image source: per-TP TIFFs (default) or raw Vutara .dat.")
 _ap.add_argument('--input_dir', default=None,
@@ -142,7 +145,10 @@ if lib.has_openmp():
 else:
     print('Fitter: serial (no OpenMP in this .so)')
 _preprocess_lib_path = os.path.join(_HERE, 'preprocess3d.so')
-if os.path.exists(_preprocess_lib_path):
+if _args.no_preprocess:
+    _pp = None
+    print('Preprocessing: disabled (--no-preprocess)')
+elif os.path.exists(_preprocess_lib_path):
     _pp = ctypes.CDLL(_preprocess_lib_path)
     _pp.preprocess_denoise_morpho.restype = None
     _pp.preprocess_denoise_morpho.argtypes = [

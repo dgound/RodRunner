@@ -71,6 +71,9 @@ def parse_args(argv=None):
                       help='Axial sigma cap in voxels, 0 = uncapped (default: 0)')
     geom.add_argument('--min-sbr', type=float, default=0,
                       help='Minimum amplitude/background to accept a fit, 0 = off (default: 0)')
+    geom.add_argument('--no-preprocess', action='store_true',
+                      help='Disable image preprocessing (denoise + morpho background removal) '
+                           'before fitting. Preprocessing is on by default.')
 
     seg = p.add_argument_group('segmentation')
     seg.add_argument('--segmentation',
@@ -300,6 +303,7 @@ def process_location(loc, args, work, env):
         py, os.path.join(pd, 'localize_probe0.py'),
         '--sigma_z_max', str(args.sigma_z_max),
         '--min_sbr', str(args.min_sbr),
+    ] + (['--no-preprocess'] if args.no_preprocess else []) + [
         '--segmentation-mode', seg,
         '--z-gate-failure-policy', 'quarantine',
         '--center-ownership', args.center_ownership,
@@ -509,7 +513,8 @@ def main(argv=None):
     print(f'output = {output_dir}')
     print(f'geometry: {args.xy_pixel_nm} nm/px, z_step={args.z_step_nm} nm, '
           f'fov={args.fov_size} px, sigma_z_max={args.sigma_z_max}'
-          f', min_sbr={args.min_sbr}')
+          f', min_sbr={args.min_sbr}'
+          f', preprocess={"off" if args.no_preprocess else "on"}')
     print(f'gates: amp_ratio>={args.min_amp_ratio}, '
           f'sep>={args.min_spot_sep_nm} nm, '
           f'SE_corr={args.se_correction_factor}x, '
