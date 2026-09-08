@@ -1,9 +1,19 @@
 /*
  * topology_engine.c — C implementation of the Yamada polynomial engine
- * and topology detection for theta-curves and two-loop links.
+ * for theta-curves and two-loop links.
  *
- * Replaces: yamada.py, topology_core.py, topology_yamada.py
- * Called from: detect_topology.py (Python orchestrator) via ctypes
+ * Replaces the Python yamada.py. Called from detect_topology.py via ctypes.
+ *
+ * Optimizations over the straight translation:
+ *   - Laurent polynomials track exponent bounds; add/mul touch only the span.
+ *   - graph_R splits into connected components (R is multiplicative over
+ *     disjoint union) before deletion-contraction.
+ *   - The 3^c skein loop is OpenMP-parallel with a per-thread memo table.
+ *   - Memo entries are variable-length and live in a bump arena that is
+ *     reset once per cell (no per-entry malloc/free).
+ *   - No per-call 2 KB memsets in canonicalize / vertex counting.
+ *   - A crossing cap makes pathological projections fail fast instead of
+ *     running for hours.
  *
  * Compile: gcc -O3 -fopenmp -shared -fPIC -o topology_engine.so topology_engine.c -lm
  */
@@ -18,799 +28,683 @@
 #include <omp.h>
 #endif
 
-/* ========================================================================
- * 1. Laurent polynomial in variable A
- *    Stored as coefficient array: coeff[i] is the coefficient of A^(i-OFFSET).
- *    Exponent range: [-MAX_EXP, +MAX_EXP].
- * ======================================================================== */
+#define MIN(a,b) ((a)<(b)?(a):(b))
+#define MAX(a,b) ((a)>(b)?(a):(b))
 
-#define MAX_EXP 64
+/* ========================================================================
+ * Limits. A diagram with more than ~20 crossings is not computable by the
+ * 3^c state sum anyway, so 32 is generous.
+ * ======================================================================== */
+#define MAX_CROSSINGS     32
+#define MAX_STRANDS       16
+#define MAX_POINTS        512
+#define MAX_SEGMENTS      512
+#define MAX_DIAGRAM_EDGES 128   /* 3 strands + 2 per crossing */
+#define MAX_GRAPH_EDGES   128
+
+/* ========================================================================
+ * 1. Laurent polynomials in A with exponent-bounds tracking.
+ *    c[e + OFFSET] is the coefficient of A^e.  Zero polynomial: lo > hi.
+ *    Slots outside [lo, hi] are never read.
+ * ======================================================================== */
+#define MAX_EXP   128
 #define POLY_SIZE (2 * MAX_EXP + 1)
-#define OFFSET MAX_EXP
+#define OFFSET    MAX_EXP
 
 typedef struct {
-    int coeff[POLY_SIZE];
+    int lo, hi;
+    int c[POLY_SIZE];
 } LPoly;
 
-static const LPoly POLY_ZERO = {{0}};
+static int g_overflow = 0;   /* set if an exponent left [-MAX_EXP, MAX_EXP] */
 
-static LPoly poly_one(void) {
-    LPoly p = POLY_ZERO;
-    p.coeff[OFFSET] = 1;
-    return p;
+static inline void poly_set_zero(LPoly *p) { p->lo = 1; p->hi = 0; }
+static inline int  poly_is_zero(const LPoly *p) { return p->lo > p->hi; }
+
+static inline void poly_set_const(LPoly *p, int v) {
+    if (v == 0) { poly_set_zero(p); return; }
+    p->lo = p->hi = 0;
+    p->c[OFFSET] = v;
 }
 
-static LPoly poly_neg_one(void) {
-    LPoly p = POLY_ZERO;
-    p.coeff[OFFSET] = -1;
-    return p;
+/* -sigma = -(A + 1 + A^-1) */
+static inline void poly_set_neg_sigma(LPoly *p) {
+    p->lo = -1; p->hi = 1;
+    p->c[OFFSET - 1] = -1; p->c[OFFSET] = -1; p->c[OFFSET + 1] = -1;
 }
 
-/* sigma = A + 1 + A^{-1} */
-static LPoly poly_neg_sigma(void) {
-    LPoly p = POLY_ZERO;
-    p.coeff[OFFSET + 1] = -1;
-    p.coeff[OFFSET]     = -1;
-    p.coeff[OFFSET - 1] = -1;
-    return p;
+static inline void poly_trim(LPoly *p) {
+    while (p->lo <= p->hi && p->c[p->lo + OFFSET] == 0) p->lo++;
+    while (p->lo <= p->hi && p->c[p->hi + OFFSET] == 0) p->hi--;
 }
 
-static LPoly poly_add(const LPoly *a, const LPoly *b) {
-    LPoly r;
-    for (int i = 0; i < POLY_SIZE; i++)
-        r.coeff[i] = a->coeff[i] + b->coeff[i];
-    return r;
+static inline void poly_copy(LPoly *dst, const LPoly *src) {
+    dst->lo = src->lo; dst->hi = src->hi;
+    if (src->lo <= src->hi)
+        memcpy(dst->c + src->lo + OFFSET, src->c + src->lo + OFFSET,
+               (size_t)(src->hi - src->lo + 1) * sizeof(int));
 }
 
-static LPoly poly_mul(const LPoly *a, const LPoly *b) {
-    LPoly r = POLY_ZERO;
-    for (int i = 0; i < POLY_SIZE; i++) {
-        if (a->coeff[i] == 0) continue;
-        for (int j = 0; j < POLY_SIZE; j++) {
-            if (b->coeff[j] == 0) continue;
-            int exp = (i - OFFSET) + (j - OFFSET);
-            if (exp >= -MAX_EXP && exp <= MAX_EXP)
-                r.coeff[exp + OFFSET] += a->coeff[i] * b->coeff[j];
+/* acc += t   (in place, safe) */
+static void poly_add_inplace(LPoly *acc, const LPoly *t) {
+    if (poly_is_zero(t)) return;
+    if (poly_is_zero(acc)) { poly_copy(acc, t); return; }
+    int lo = MIN(acc->lo, t->lo), hi = MAX(acc->hi, t->hi);
+    for (int e = lo; e <= hi; e++) {
+        int v = 0;
+        if (e >= acc->lo && e <= acc->hi) v += acc->c[e + OFFSET];
+        if (e >= t->lo   && e <= t->hi)   v += t->c[e + OFFSET];
+        acc->c[e + OFFSET] = v;
+    }
+    acc->lo = lo; acc->hi = hi;
+    poly_trim(acc);
+}
+
+/* out = a * b   (out must not alias a or b) */
+static void poly_mul(const LPoly *a, const LPoly *b, LPoly *out) {
+    if (poly_is_zero(a) || poly_is_zero(b)) { poly_set_zero(out); return; }
+    int lo = a->lo + b->lo, hi = a->hi + b->hi;
+    if (lo < -MAX_EXP || hi > MAX_EXP) {
+        g_overflow = 1;
+        lo = MAX(lo, -MAX_EXP); hi = MIN(hi, MAX_EXP);
+    }
+    for (int e = lo; e <= hi; e++) out->c[e + OFFSET] = 0;
+    for (int i = a->lo; i <= a->hi; i++) {
+        int ai = a->c[i + OFFSET];
+        if (!ai) continue;
+        for (int j = b->lo; j <= b->hi; j++) {
+            int e = i + j;
+            if (e < -MAX_EXP || e > MAX_EXP) continue;
+            out->c[e + OFFSET] += ai * b->c[j + OFFSET];
         }
     }
-    return r;
+    out->lo = lo; out->hi = hi;
+    poly_trim(out);
 }
 
-static LPoly poly_scale_mono(const LPoly *p, int exp, int coef) {
-    LPoly r = POLY_ZERO;
-    for (int i = 0; i < POLY_SIZE; i++) {
-        if (p->coeff[i] == 0) continue;
-        int new_exp = (i - OFFSET) + exp;
-        if (new_exp >= -MAX_EXP && new_exp <= MAX_EXP)
-            r.coeff[new_exp + OFFSET] += p->coeff[i] * coef;
-    }
-    return r;
+/* out = coef * A^exp * p */
+static void poly_scale_mono(const LPoly *p, int exp, int coef, LPoly *out) {
+    if (poly_is_zero(p) || coef == 0) { poly_set_zero(out); return; }
+    int lo = p->lo + exp, hi = p->hi + exp;
+    if (lo < -MAX_EXP || hi > MAX_EXP) g_overflow = 1;
+    int clo = MAX(lo, -MAX_EXP), chi = MIN(hi, MAX_EXP);
+    for (int e = clo; e <= chi; e++)
+        out->c[e + OFFSET] = coef * p->c[e - exp + OFFSET];
+    out->lo = clo; out->hi = chi;
+    poly_trim(out);
 }
 
-static int poly_is_zero(const LPoly *p) {
-    for (int i = 0; i < POLY_SIZE; i++)
-        if (p->coeff[i] != 0) return 0;
-    return 1;
+static inline void poly_negate_inplace(LPoly *p) {
+    for (int e = p->lo; e <= p->hi; e++) p->c[e + OFFSET] = -p->c[e + OFFSET];
 }
 
-static int poly_min_exp(const LPoly *p) {
-    for (int i = 0; i < POLY_SIZE; i++)
-        if (p->coeff[i] != 0) return i - OFFSET;
-    return 0;
-}
-
-/* Normalize: shift min exponent to 0, canonical sign via (-A)^n rule. */
-static LPoly poly_normalize(const LPoly *p) {
-    if (poly_is_zero(p)) return POLY_ZERO;
-    int m = poly_min_exp(p);
+/* Canonical representative modulo (-A)^n: min exponent -> 0, sign fixed. */
+static void poly_normalize(const LPoly *p, LPoly *out) {
+    if (poly_is_zero(p)) { poly_set_zero(out); return; }
+    int m = p->lo;
     int sign = ((-m) % 2 != 0) ? -1 : 1;
-    LPoly r = POLY_ZERO;
-    for (int i = 0; i < POLY_SIZE; i++) {
-        if (p->coeff[i] == 0) continue;
-        int new_i = (i - OFFSET) - m + OFFSET;
-        if (new_i >= 0 && new_i < POLY_SIZE)
-            r.coeff[new_i] = sign * p->coeff[i];
-    }
-    return r;
-}
-
-static int poly_equal(const LPoly *a, const LPoly *b) {
-    return memcmp(a->coeff, b->coeff, sizeof(a->coeff)) == 0;
-}
-
-/* Compare up to multiplication by (-A)^n. */
-static int poly_equal_up_to_unit(const LPoly *a, const LPoly *b) {
-    LPoly na = poly_normalize(a);
-    LPoly nb = poly_normalize(b);
-    return poly_equal(&na, &nb);
-}
-
-/* Write polynomial to a JSON-like string: {exp: coeff, ...}
- * buf must be large enough. Returns length written. */
-static int poly_to_json(const LPoly *p, char *buf, int bufsize) {
-    int pos = 0;
-    pos += snprintf(buf + pos, bufsize - pos, "{");
-    int first = 1;
-    for (int i = 0; i < POLY_SIZE; i++) {
-        if (p->coeff[i] == 0) continue;
-        if (!first) pos += snprintf(buf + pos, bufsize - pos, ",");
-        pos += snprintf(buf + pos, bufsize - pos, "\"%d\":%d", i - OFFSET, p->coeff[i]);
-        first = 0;
-    }
-    pos += snprintf(buf + pos, bufsize - pos, "}");
-    return pos;
+    poly_scale_mono(p, -m, sign, out);
 }
 
 /* ========================================================================
- * 2. Graph R — Yamada graph invariant via deletion-contraction
- *    Memoized with a hash table.
+ * 2. Memo table: bump arena + chained hash, variable-length entries.
+ *    One Memo per thread; reset once per cell.
  * ======================================================================== */
 
-#define MAX_GRAPH_EDGES 128
-#define MEMO_BUCKETS 65521   /* prime */
+typedef struct { int u, v; } Edge;
 
-typedef struct {
-    int u, v;
-} Edge;
+typedef struct Chunk {
+    struct Chunk *next;
+    size_t cap, used;
+    unsigned char data[];
+} Chunk;
 
-typedef struct {
-    int iso;            /* isolated vertex count */
-    int n_edges;
-    Edge edges[MAX_GRAPH_EDGES];
-} CanonGraph;
+#define CHUNK_BYTES (4u << 20)   /* 4 MB */
 
 typedef struct MemoEntry {
-    CanonGraph key;
-    LPoly val;
     struct MemoEntry *next;
+    unsigned hash;
+    int iso, n_edges, plo, phi;
+    /* followed by Edge[n_edges], then int coeff[phi - plo + 1] */
 } MemoEntry;
 
-static MemoEntry *memo_table[MEMO_BUCKETS];
-static int memo_count = 0;
+#define MEMO_BUCKETS 32749
 
-static unsigned int graph_hash(const CanonGraph *g) {
-    unsigned int h = (unsigned int)g->iso * 2654435761u;
-    for (int i = 0; i < g->n_edges; i++) {
-        h ^= (unsigned int)(g->edges[i].u * 31 + g->edges[i].v) * 2246822519u;
+typedef struct {
+    MemoEntry **buckets;
+    Chunk *head;
+    long long hits, misses;
+} Memo;
+
+static void *arena_alloc(Memo *m, size_t size) {
+    size = (size + 7u) & ~(size_t)7u;
+    if (!m->head || m->head->used + size > m->head->cap) {
+        size_t cap = MAX((size_t)CHUNK_BYTES, size);
+        Chunk *ch = (Chunk *)malloc(sizeof(Chunk) + cap);
+        ch->next = m->head; ch->cap = cap; ch->used = 0;
+        m->head = ch;
+    }
+    void *p = m->head->data + m->head->used;
+    m->head->used += size;
+    return p;
+}
+
+static Memo *memo_new(void) {
+    Memo *m = (Memo *)calloc(1, sizeof(Memo));
+    m->buckets = (MemoEntry **)calloc(MEMO_BUCKETS, sizeof(MemoEntry *));
+    return m;
+}
+
+static void memo_free(Memo *m) {
+    if (!m) return;
+    Chunk *ch = m->head;
+    while (ch) { Chunk *n = ch->next; free(ch); ch = n; }
+    free(m->buckets);
+    free(m);
+}
+
+static inline Edge *entry_edges(MemoEntry *e) {
+    return (Edge *)((unsigned char *)e + ((sizeof(MemoEntry) + 7u) & ~(size_t)7u));
+}
+static inline int *entry_coeff(MemoEntry *e) {
+    return (int *)(entry_edges(e) + e->n_edges);
+}
+
+static unsigned graph_hash(int iso, const Edge *edges, int n) {
+    unsigned h = (unsigned)iso * 2654435761u ^ (unsigned)n * 40503u;
+    for (int i = 0; i < n; i++) {
+        h ^= (unsigned)(edges[i].u * 31 + edges[i].v) * 2246822519u;
         h = (h << 13) | (h >> 19);
     }
-    return h % MEMO_BUCKETS;
+    return h;
 }
 
-static int graph_equal(const CanonGraph *a, const CanonGraph *b) {
-    if (a->iso != b->iso || a->n_edges != b->n_edges) return 0;
-    return memcmp(a->edges, b->edges, (size_t)a->n_edges * sizeof(Edge)) == 0;
-}
-
-static LPoly *memo_get(const CanonGraph *key) {
-    unsigned int h = graph_hash(key);
-    for (MemoEntry *e = memo_table[h]; e; e = e->next)
-        if (graph_equal(&e->key, key)) return &e->val;
+static MemoEntry *memo_get(Memo *m, unsigned h, int iso, const Edge *edges, int n) {
+    for (MemoEntry *e = m->buckets[h % MEMO_BUCKETS]; e; e = e->next) {
+        if (e->hash != h || e->iso != iso || e->n_edges != n) continue;
+        if (memcmp(entry_edges(e), edges, (size_t)n * sizeof(Edge)) == 0) return e;
+    }
     return NULL;
 }
 
-static void memo_put(const CanonGraph *key, const LPoly *val) {
-    unsigned int h = graph_hash(key);
-    MemoEntry *e = (MemoEntry *)malloc(sizeof(MemoEntry));
-    e->key = *key;
-    e->val = *val;
-    e->next = memo_table[h];
-    memo_table[h] = e;
-    memo_count++;
+static void memo_put(Memo *m, unsigned h, int iso, const Edge *edges, int n,
+                     const LPoly *val) {
+    int span = poly_is_zero(val) ? 0 : (val->hi - val->lo + 1);
+    size_t hdr = (sizeof(MemoEntry) + 7u) & ~(size_t)7u;
+    size_t size = hdr + (size_t)n * sizeof(Edge) + (size_t)span * sizeof(int);
+    MemoEntry *e = (MemoEntry *)arena_alloc(m, size);
+    e->hash = h; e->iso = iso; e->n_edges = n;
+    e->plo = val->lo; e->phi = val->hi;
+    memcpy(entry_edges(e), edges, (size_t)n * sizeof(Edge));
+    if (span) memcpy(entry_coeff(e), val->c + val->lo + OFFSET, (size_t)span * sizeof(int));
+    e->next = m->buckets[h % MEMO_BUCKETS];
+    m->buckets[h % MEMO_BUCKETS] = e;
 }
 
-void memo_clear(void) {
-    for (int i = 0; i < MEMO_BUCKETS; i++) {
-        MemoEntry *e = memo_table[i];
-        while (e) { MemoEntry *next = e->next; free(e); e = next; }
-        memo_table[i] = NULL;
-    }
-    memo_count = 0;
-}
-
-static int edge_cmp(const void *a, const void *b) {
-    const Edge *ea = (const Edge *)a, *eb = (const Edge *)b;
-    if (ea->u != eb->u) return ea->u - eb->u;
-    return ea->v - eb->v;
-}
-
-static CanonGraph canonicalize(int num_v, const Edge *edges, int n_edges) {
-    /* Relabel vertices by first appearance in sorted edge list. */
-    Edge sorted[MAX_GRAPH_EDGES];
-    for (int i = 0; i < n_edges; i++) {
-        sorted[i].u = edges[i].u < edges[i].v ? edges[i].u : edges[i].v;
-        sorted[i].v = edges[i].u < edges[i].v ? edges[i].v : edges[i].u;
-    }
-    qsort(sorted, (size_t)n_edges, sizeof(Edge), edge_cmp);
-
-    int map[512];
-    memset(map, -1, sizeof(map));
-    int next_id = 0;
-    CanonGraph g;
-    g.n_edges = n_edges;
-    for (int i = 0; i < n_edges; i++) {
-        if (map[sorted[i].u] < 0) map[sorted[i].u] = next_id++;
-        if (map[sorted[i].v] < 0) map[sorted[i].v] = next_id++;
-        int a = map[sorted[i].u], b = map[sorted[i].v];
-        g.edges[i].u = a < b ? a : b;
-        g.edges[i].v = a < b ? b : a;
-    }
-    qsort(g.edges, (size_t)n_edges, sizeof(Edge), edge_cmp);
-    g.iso = num_v - next_id;
-    return g;
-}
-
-static int count_vertices(const Edge *edges, int n) {
-    int seen[512]; memset(seen, 0, sizeof(seen));
-    int cnt = 0;
-    for (int i = 0; i < n; i++) {
-        if (!seen[edges[i].u]) { seen[edges[i].u] = 1; cnt++; }
-        if (!seen[edges[i].v]) { seen[edges[i].v] = 1; cnt++; }
-    }
-    return cnt;
-}
-
-static LPoly graph_R(int num_v, const Edge *edges, int n_edges);
-
-static LPoly graph_R_canon(int iso, const Edge *edges, int n_edges) {
-    LPoly base = (iso % 2 == 0) ? poly_one() : poly_neg_one();
-
-    if (n_edges == 0) return base;
-
-    /* Strip loops */
-    int n_loops = 0;
-    Edge non_loop[MAX_GRAPH_EDGES];
-    int n_nl = 0;
-    for (int i = 0; i < n_edges; i++) {
-        if (edges[i].u == edges[i].v) n_loops++;
-        else non_loop[n_nl++] = edges[i];
-    }
-    if (n_loops > 0) {
-        LPoly sub = graph_R(count_vertices(edges, n_edges), non_loop, n_nl);
-        LPoly ns = poly_neg_sigma();
-        LPoly f = poly_one();
-        for (int i = 0; i < n_loops; i++)
-            f = poly_mul(&f, &ns);
-        LPoly prod = poly_mul(&f, &sub);
-        if (iso) return poly_mul(&base, &prod);
-        return prod;
-    }
-
-    /* Deletion-contraction on first edge */
-    int u = edges[0].u, v = edges[0].v;
-    int nv = count_vertices(edges, n_edges);
-
-    /* Delete */
-    LPoly R_del = graph_R(nv, edges + 1, n_edges - 1);
-
-    /* Contract: merge v into u */
-    Edge merged[MAX_GRAPH_EDGES];
-    int nm = 0;
-    for (int i = 1; i < n_edges; i++) {
-        int a = edges[i].u == v ? u : edges[i].u;
-        int b = edges[i].v == v ? u : edges[i].v;
-        merged[nm].u = a; merged[nm].v = b; nm++;
-    }
-    LPoly R_con = graph_R(nv - 1, merged, nm);
-
-    LPoly val = poly_add(&R_del, &R_con);
-    if (iso) return poly_mul(&base, &val);
-    return val;
-}
-
-static LPoly graph_R(int num_v, const Edge *edges, int n_edges) {
-    if (n_edges > MAX_GRAPH_EDGES) n_edges = MAX_GRAPH_EDGES;
-    CanonGraph key = canonicalize(num_v, edges, n_edges);
-    LPoly *cached = memo_get(&key);
-    if (cached) return *cached;
-    LPoly val = graph_R_canon(key.iso, key.edges, key.n_edges);
-    memo_put(&key, &val);
-    return val;
+static inline void entry_to_poly(const MemoEntry *e, LPoly *out) {
+    out->lo = e->plo; out->hi = e->phi;
+    if (e->plo <= e->phi)
+        memcpy(out->c + e->plo + OFFSET, entry_coeff((MemoEntry *)e),
+               (size_t)(e->phi - e->plo + 1) * sizeof(int));
 }
 
 /* ========================================================================
- * 3. Crossing detection: 2D segment-segment intersection with depth
+ * 3. graph_R — Yamada graph invariant of an abstract multigraph.
+ *    R(G) = R(G-e) + R(G/e)   e non-loop
+ *    R(G) = -sigma R(G-e)     e loop
+ *    R(k isolated) = (-1)^k
+ *    R(G1 ⊔ G2) = R(G1) R(G2)  (follows from the above by induction)
  * ======================================================================== */
 
-#define MAX_CROSSINGS 4096
+static int edge_cmp(const void *a, const void *b) {
+    const Edge *x = (const Edge *)a, *y = (const Edge *)b;
+    if (x->u != y->u) return x->u - y->u;
+    return x->v - y->v;
+}
+
+/* Sort + relabel by first appearance. Returns number of distinct vertices.
+ * `out` receives normalized canonical edges (u <= v, sorted). */
+static int canonicalize(const Edge *edges, int n, Edge *out) {
+    int maxv = -1;
+    for (int i = 0; i < n; i++) {
+        out[i].u = MIN(edges[i].u, edges[i].v);
+        out[i].v = MAX(edges[i].u, edges[i].v);
+        if (out[i].v > maxv) maxv = out[i].v;
+    }
+    if (n == 0) return 0;
+    qsort(out, (size_t)n, sizeof(Edge), edge_cmp);
+    int map[maxv + 1];
+    for (int i = 0; i <= maxv; i++) map[i] = -1;
+    int next = 0;
+    for (int i = 0; i < n; i++) {
+        if (map[out[i].u] < 0) map[out[i].u] = next++;
+        if (map[out[i].v] < 0) map[out[i].v] = next++;
+        int a = map[out[i].u], b = map[out[i].v];
+        out[i].u = MIN(a, b); out[i].v = MAX(a, b);
+    }
+    qsort(out, (size_t)n, sizeof(Edge), edge_cmp);
+    return next;
+}
+
+static void graph_R(Memo *m, int num_v, const Edge *edges, int n, LPoly *out);
+
+/* Union-find helpers over labels 0..nv-1 */
+static inline int uf_find(int *par, int x) {
+    while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; }
+    return x;
+}
+
+/* edges: canonical labels 0..nv-1, every label has degree >= 1. */
+static void graph_R_canon(Memo *m, int iso, const Edge *edges, int n, int nv, LPoly *out) {
+    if (n == 0) { poly_set_const(out, (iso % 2) ? -1 : 1); return; }
+
+    /* --- strip loops: factor (-sigma)^loops --- */
+    int n_loops = 0;
+    Edge rest[MAX_GRAPH_EDGES];
+    int nr = 0;
+    for (int i = 0; i < n; i++) {
+        if (edges[i].u == edges[i].v) n_loops++;
+        else rest[nr++] = edges[i];
+    }
+    if (n_loops > 0) {
+        LPoly sub, f, ns, tmp;
+        graph_R(m, nv, rest, nr, &sub);
+        poly_set_neg_sigma(&ns);
+        poly_set_const(&f, 1);
+        for (int i = 0; i < n_loops; i++) { poly_mul(&f, &ns, &tmp); poly_copy(&f, &tmp); }
+        poly_mul(&f, &sub, out);
+        if (iso % 2) poly_negate_inplace(out);
+        return;
+    }
+
+    /* --- connected components: R is multiplicative --- */
+    {
+        int par[nv];
+        for (int i = 0; i < nv; i++) par[i] = i;
+        for (int i = 0; i < n; i++) {
+            int a = uf_find(par, edges[i].u), b = uf_find(par, edges[i].v);
+            if (a != b) par[a] = b;
+        }
+        int root_of[nv], n_comp = 0;
+        int comp_id[nv];
+        for (int i = 0; i < nv; i++) comp_id[i] = -1;
+        for (int i = 0; i < nv; i++) {
+            int r = uf_find(par, i);
+            if (comp_id[r] < 0) { comp_id[r] = n_comp; root_of[n_comp] = r; n_comp++; }
+        }
+        if (n_comp > 1) {
+            LPoly prod, sub, tmp;
+            poly_set_const(&prod, 1);
+            Edge ce[MAX_GRAPH_EDGES];
+            for (int c = 0; c < n_comp; c++) {
+                int nce = 0, nverts = 0;
+                for (int i = 0; i < nv; i++) if (uf_find(par, i) == root_of[c]) nverts++;
+                for (int i = 0; i < n; i++)
+                    if (uf_find(par, edges[i].u) == root_of[c]) ce[nce++] = edges[i];
+                graph_R(m, nverts, ce, nce, &sub);
+                poly_mul(&prod, &sub, &tmp);
+                poly_copy(&prod, &tmp);
+            }
+            poly_copy(out, &prod);
+            if (iso % 2) poly_negate_inplace(out);
+            return;
+        }
+    }
+
+    /* --- deletion-contraction on the first edge --- */
+    int u = edges[0].u, v = edges[0].v;
+    LPoly R_del, R_con;
+    graph_R(m, nv, edges + 1, n - 1, &R_del);
+    Edge merged[MAX_GRAPH_EDGES];
+    for (int i = 1; i < n; i++) {
+        merged[i - 1].u = (edges[i].u == v) ? u : edges[i].u;
+        merged[i - 1].v = (edges[i].v == v) ? u : edges[i].v;
+    }
+    graph_R(m, nv - 1, merged, n - 1, &R_con);
+    poly_copy(out, &R_del);
+    poly_add_inplace(out, &R_con);
+    if (iso % 2) poly_negate_inplace(out);
+}
+
+static void graph_R(Memo *m, int num_v, const Edge *edges, int n, LPoly *out) {
+    if (n > MAX_GRAPH_EDGES) n = MAX_GRAPH_EDGES;
+    Edge key[MAX_GRAPH_EDGES];
+    int nd = canonicalize(edges, n, key);
+    int iso = num_v - nd;
+    unsigned h = graph_hash(iso, key, n);
+    MemoEntry *e = memo_get(m, h, iso, key, n);
+    if (e) { m->hits++; entry_to_poly(e, out); return; }
+    m->misses++;
+    graph_R_canon(m, iso, key, n, nd, out);
+    memo_put(m, h, iso, key, n, out);
+}
+
+/* ========================================================================
+ * 4. Crossing detection: 2D segment-segment intersection with depth.
+ * ======================================================================== */
 
 typedef struct {
     int seg_i, seg_j;
-    double ti, tj;
-    double zi, zj;
-    double px, py;
+    double ti, tj, zi, zj, px, py;
 } CrossingRecord;
 
-/* Find all crossings between projected segments.
- * segments: [n_seg][6] = (x0,y0,z0,x1,y1,z1) after rotation.
- * meta: [n_seg][3] = (strand_id, endpoint_id_0, endpoint_id_1).
- * Returns number of crossings found; fills `out`.
- * Returns -1 if non-generic (degenerate) projection. */
-static int find_crossings(const double *segments, const int *meta, int n_seg,
-                           CrossingRecord *out) {
+/* Returns crossing count, -1 if non-generic, -2 if more than cap. */
+static int find_crossings(const double *seg, const int *meta, int n_seg,
+                          CrossingRecord *out, int cap) {
     int count = 0;
-    for (int i = 0; i < n_seg && count < MAX_CROSSINGS; i++) {
-        const double *a = segments + i * 6;
-        for (int j = i + 1; j < n_seg && count < MAX_CROSSINGS; j++) {
-            const double *b = segments + j * 6;
-            /* Skip if segments share an endpoint */
-            const int *mi = meta + i * 3;
+    for (int i = 0; i < n_seg; i++) {
+        const double *a = seg + i * 6;
+        const int *mi = meta + i * 3;
+        for (int j = i + 1; j < n_seg; j++) {
             const int *mj = meta + j * 3;
-            if (mi[1] == mj[1] || mi[1] == mj[2] ||
-                mi[2] == mj[1] || mi[2] == mj[2]) continue;
-
-            double dax = a[3] - a[0], day = a[4] - a[1];
-            double dbx = b[3] - b[0], dby = b[4] - b[1];
-            double denom = dax * dby - day * dbx;
-            if (fabs(denom) < 1e-9) continue;
-
-            double ox = b[0] - a[0], oy = b[1] - a[1];
-            double ta = (ox * dby - oy * dbx) / denom;
-            double tb = (ox * day - oy * dax) / denom;
-
-            if (ta > 1e-7 && ta < 1.0 - 1e-7 && tb > 1e-7 && tb < 1.0 - 1e-7) {
-                double za = a[2] * (1.0 - ta) + a[5] * ta;
-                double zb = b[2] * (1.0 - tb) + b[5] * tb;
+            if (mi[1] == mj[1] || mi[1] == mj[2] || mi[2] == mj[1] || mi[2] == mj[2]) continue;
+            const double *b = seg + j * 6;
+            double dax = a[3]-a[0], day = a[4]-a[1], dbx = b[3]-b[0], dby = b[4]-b[1];
+            double den = dax*dby - day*dbx;
+            if (fabs(den) < 1e-9) continue;
+            double ox = b[0]-a[0], oy = b[1]-a[1];
+            double ta = (ox*dby - oy*dbx) / den, tb = (ox*day - oy*dax) / den;
+            if (ta > 1e-7 && ta < 1.0-1e-7 && tb > 1e-7 && tb < 1.0-1e-7) {
+                double za = a[2]*(1.0-ta) + a[5]*ta, zb = b[2]*(1.0-tb) + b[5]*tb;
                 if (fabs(za - zb) < 1e-9) return -1;
-
-                out[count].seg_i = i;
-                out[count].seg_j = j;
-                out[count].ti = ta;
-                out[count].tj = tb;
-                out[count].zi = za;
-                out[count].zj = zb;
-                out[count].px = a[0] + dax * ta;
-                out[count].py = a[1] + day * ta;
-                count++;
-            } else if (ta >= -1e-7 && ta <= 1.0 + 1e-7 &&
-                       tb >= -1e-7 && tb <= 1.0 + 1e-7) {
-                return -1; /* near-degenerate */
+                if (count >= cap) return -2;
+                CrossingRecord *r = &out[count++];
+                r->seg_i = i; r->seg_j = j; r->ti = ta; r->tj = tb; r->zi = za; r->zj = zb;
+                r->px = a[0] + dax*ta; r->py = a[1] + day*ta;
+            } else if (ta >= -1e-7 && ta <= 1.0+1e-7 && tb >= -1e-7 && tb <= 1.0+1e-7) {
+                return -1;
             }
         }
     }
-    /* Check crossing-crossing separation */
     for (int i = 0; i < count; i++)
         for (int j = i + 1; j < count; j++) {
-            double dx = out[i].px - out[j].px;
-            double dy = out[i].py - out[j].py;
-            if (dx * dx + dy * dy < 1e-12) return -1;
+            double dx = out[i].px - out[j].px, dy = out[i].py - out[j].py;
+            if (dx*dx + dy*dy < 1e-12) return -1;
         }
     return count;
 }
 
 /* ========================================================================
- * 4. Diagram building + skein resolution
+ * 5. Spatial graph, diagram building, skein resolution.
  * ======================================================================== */
-
-/* A diagram edge endpoint: either a graph vertex or a crossing port. */
-typedef struct {
-    int is_vertex;   /* 1 = graph vertex, 0 = crossing */
-    int id;          /* vertex index or crossing index */
-    int port;        /* crossing port (0..3) if is_vertex==0, unused otherwise */
-} DiagramEndpoint;
-
-typedef struct {
-    DiagramEndpoint a, b;
-} DiagramEdge;
-
-#define MAX_DIAGRAM_EDGES 512
-#define MAX_STRANDS 16
-#define MAX_SEGMENTS 256
-#define MAX_POINTS 512
 
 typedef struct {
     int n_vertices;
-    double vertices[MAX_POINTS * 3];   /* [n_vertices][3] */
+    double vertices[MAX_POINTS * 3];
     int n_strands;
-    int strand_start[MAX_STRANDS];     /* index into points array */
-    int strand_len[MAX_STRANDS];       /* number of points per strand */
-    double points[MAX_POINTS * 3];     /* all strand points concatenated */
-    int strand_endv[MAX_STRANDS * 2];  /* [strand][0/1] = vertex id of start/end */
+    int strand_start[MAX_STRANDS], strand_len[MAX_STRANDS];
+    double points[MAX_POINTS * 3];
+    int strand_endv[MAX_STRANDS * 2];
 } SpatialGraph;
 
-/* Build segments + metadata from spatial graph for crossing detection.
- * Point IDs use coincidence classes: points within tol of each other
- * share the same ID, so the crossing detector skips adjacent segments. */
+typedef struct { int is_vertex, id, port; } DiagramEndpoint;
+typedef struct { DiagramEndpoint a, b; } DiagramEdge;
+
 static int build_segments(const SpatialGraph *sg, double tol,
                           double *seg6, int *meta3, int *seg_loc2) {
-    /* Assign coincidence-class IDs to all points */
-    int total_pts = 0;
-    for (int si = 0; si < sg->n_strands; si++)
-        total_pts += sg->strand_len[si];
-
+    int total = 0;
+    for (int si = 0; si < sg->n_strands; si++) total += sg->strand_len[si];
     int pid[MAX_POINTS];
-    for (int i = 0; i < total_pts; i++) pid[i] = i;
-    for (int i = 0; i < total_pts; i++) {
-        const double *pi = sg->points + i * 3;
-        for (int j = i + 1; j < total_pts; j++) {
-            double dx = pi[0] - sg->points[j*3];
-            double dy = pi[1] - sg->points[j*3+1];
-            double dz = pi[2] - sg->points[j*3+2];
-            if (sqrt(dx*dx+dy*dy+dz*dz) < tol)
-                pid[j] = pid[i];
+    for (int i = 0; i < total; i++) pid[i] = i;
+    for (int i = 0; i < total; i++) {
+        const double *p = sg->points + i * 3;
+        for (int j = i + 1; j < total; j++) {
+            if (pid[j] != j) continue;
+            double dx = p[0]-sg->points[j*3], dy = p[1]-sg->points[j*3+1], dz = p[2]-sg->points[j*3+2];
+            if (dx*dx + dy*dy + dz*dz < tol*tol) pid[j] = pid[i];
         }
     }
-
     int n = 0;
     for (int si = 0; si < sg->n_strands; si++) {
-        int start = sg->strand_start[si];
-        int len = sg->strand_len[si];
+        int st = sg->strand_start[si], len = sg->strand_len[si];
         for (int k = 0; k < len - 1 && n < MAX_SEGMENTS; k++) {
-            const double *p0 = sg->points + (start + k) * 3;
-            const double *p1 = sg->points + (start + k + 1) * 3;
-            seg6[n * 6 + 0] = p0[0]; seg6[n * 6 + 1] = p0[1]; seg6[n * 6 + 2] = p0[2];
-            seg6[n * 6 + 3] = p1[0]; seg6[n * 6 + 4] = p1[1]; seg6[n * 6 + 5] = p1[2];
-            meta3[n * 3 + 0] = si;
-            meta3[n * 3 + 1] = pid[start + k];
-            meta3[n * 3 + 2] = pid[start + k + 1];
-            seg_loc2[n * 2 + 0] = si;
-            seg_loc2[n * 2 + 1] = k;
+            const double *p0 = sg->points + (st+k)*3, *p1 = sg->points + (st+k+1)*3;
+            memcpy(seg6 + n*6, p0, 3*sizeof(double));
+            memcpy(seg6 + n*6 + 3, p1, 3*sizeof(double));
+            meta3[n*3] = si; meta3[n*3+1] = pid[st+k]; meta3[n*3+2] = pid[st+k+1];
+            seg_loc2[n*2] = si; seg_loc2[n*2+1] = k;
             n++;
         }
     }
     return n;
 }
 
-/* Rotate all segments: out = seg @ rot^T. seg and out are [n][6]. */
-static void rotate_segments(const double *seg, double *out, int n, const double *rot) {
-    for (int i = 0; i < n; i++) {
-        for (int pt = 0; pt < 2; pt++) {
-            const double *p = seg + i * 6 + pt * 3;
-            double *q = out + i * 6 + pt * 3;
-            q[0] = p[0]*rot[0] + p[1]*rot[1] + p[2]*rot[2];
-            q[1] = p[0]*rot[3] + p[1]*rot[4] + p[2]*rot[5];
-            q[2] = p[0]*rot[6] + p[1]*rot[7] + p[2]*rot[8];
-        }
+static void rotate_segments(const double *seg, double *out, int n, const double *R) {
+    for (int i = 0; i < n * 2; i++) {
+        const double *p = seg + i*3; double *q = out + i*3;
+        q[0] = p[0]*R[0] + p[1]*R[1] + p[2]*R[2];
+        q[1] = p[0]*R[3] + p[1]*R[4] + p[2]*R[5];
+        q[2] = p[0]*R[6] + p[1]*R[7] + p[2]*R[8];
     }
 }
 
-/* Build the diagram from crossings and resolve via Yamada skein.
- * Returns the Yamada polynomial. Sets *n_crossings_out. */
-static LPoly build_and_resolve(const SpatialGraph *sg, const CrossingRecord *xings,
-                                int n_xings, const double *rot_seg, const int *seg_loc,
-                                int n_seg, int *n_crossings_out) {
+static long long g_last_states = 0, g_last_hits = 0, g_last_misses = 0;
+
+static void build_and_resolve(const SpatialGraph *sg, const CrossingRecord *x, int nx,
+                              const double *rseg, const int *seg_loc, LPoly *total) {
     int nV = sg->n_vertices;
-    *n_crossings_out = n_xings;
 
-    /* Assign CCW ports for each crossing */
-    int slot[MAX_CROSSINGS][4]; /* slot[k][port_label] = ccw_position */
-    /* port_label: 0=over_out, 1=over_in, 2=under_out, 3=under_in */
-    for (int k = 0; k < n_xings; k++) {
-        int gi = xings[k].seg_i, gj = xings[k].seg_j;
-        int over_first = xings[k].zi > xings[k].zj;
-        const double *a = rot_seg + gi * 6;
-        const double *b = rot_seg + gj * 6;
-        double di[2] = {a[3]-a[0], a[4]-a[1]};
-        double dj[2] = {b[3]-b[0], b[4]-b[1]};
-        double *d_over = over_first ? di : dj;
-        double *d_under = over_first ? dj : di;
-        double dirs[4][2] = {
-            { d_over[0],  d_over[1]},   /* over_out */
-            {-d_over[0], -d_over[1]},   /* over_in */
-            { d_under[0], d_under[1]},  /* under_out */
-            {-d_under[0],-d_under[1]}   /* under_in */
-        };
-        double ang[4];
+    /* CCW port assignment per crossing. label: 0=over_out 1=over_in 2=under_out 3=under_in */
+    int slot[MAX_CROSSINGS][4];
+    for (int k = 0; k < nx; k++) {
+        const double *a = rseg + x[k].seg_i*6, *b = rseg + x[k].seg_j*6;
+        int over_first = x[k].zi > x[k].zj;
+        double di[2] = {a[3]-a[0], a[4]-a[1]}, dj[2] = {b[3]-b[0], b[4]-b[1]};
+        double *dO = over_first ? di : dj, *dU = over_first ? dj : di;
+        double dirs[4][2] = {{dO[0],dO[1]},{-dO[0],-dO[1]},{dU[0],dU[1]},{-dU[0],-dU[1]}};
+        double ang[4]; int order[4] = {0,1,2,3};
         for (int i = 0; i < 4; i++) ang[i] = atan2(dirs[i][1], dirs[i][0]);
-        int order[4] = {0,1,2,3};
-        /* Sort by angle */
-        for (int i = 0; i < 3; i++)
-            for (int j = i+1; j < 4; j++)
-                if (ang[order[i]] > ang[order[j]]) {
-                    int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
-                }
-        /* Rotate so first is an over-strand port (label 0 or 1) */
-        while (order[0] >= 2) {
-            int tmp = order[0];
-            order[0] = order[1]; order[1] = order[2];
-            order[2] = order[3]; order[3] = tmp;
+        for (int i = 0; i < 3; i++) for (int j = i+1; j < 4; j++)
+            if (ang[order[i]] > ang[order[j]]) { int t = order[i]; order[i] = order[j]; order[j] = t; }
+        while (order[0] >= 2) { int t = order[0]; order[0]=order[1]; order[1]=order[2]; order[2]=order[3]; order[3]=t; }
+        for (int pos = 0; pos < 4; pos++) slot[k][order[pos]] = pos;
+    }
+
+    /* Per-strand ordered crossing events */
+    typedef struct { int seg; double t; int k; int over; } Ev;
+    Ev ev[MAX_STRANDS][MAX_CROSSINGS];
+    int nev[MAX_STRANDS];
+    memset(nev, 0, sizeof(nev));
+    for (int k = 0; k < nx; k++) {
+        int gi = x[k].seg_i, gj = x[k].seg_j, of = x[k].zi > x[k].zj;
+        int si = seg_loc[gi*2], sj = seg_loc[gj*2];
+        ev[si][nev[si]++] = (Ev){seg_loc[gi*2+1], x[k].ti, k, of ? 1 : 0};
+        ev[sj][nev[sj]++] = (Ev){seg_loc[gj*2+1], x[k].tj, k, of ? 0 : 1};
+    }
+    for (int s = 0; s < sg->n_strands; s++)
+        for (int i = 0; i < nev[s]-1; i++) for (int j = i+1; j < nev[s]; j++) {
+            Ev *A = &ev[s][i], *B = &ev[s][j];
+            if (A->seg > B->seg || (A->seg == B->seg && A->t > B->t)) { Ev t = *A; *A = *B; *B = t; }
         }
-        for (int pos = 0; pos < 4; pos++)
-            slot[k][order[pos]] = pos;
-    }
 
-    /* Build chain of events per strand */
-    typedef struct { int sort_key_seg; double sort_key_t; int xing_idx; int is_over; } StrandEvent;
-    StrandEvent events[MAX_STRANDS][MAX_CROSSINGS];
-    int n_events[MAX_STRANDS];
-    memset(n_events, 0, sizeof(n_events));
-
-    for (int k = 0; k < n_xings; k++) {
-        int gi = xings[k].seg_i, gj = xings[k].seg_j;
-        int si_strand = seg_loc[gi * 2], si_seg = seg_loc[gi * 2 + 1];
-        int sj_strand = seg_loc[gj * 2], sj_seg = seg_loc[gj * 2 + 1];
-        int over_first = xings[k].zi > xings[k].zj;
-
-        int ni = n_events[si_strand]++;
-        events[si_strand][ni].sort_key_seg = si_seg;
-        events[si_strand][ni].sort_key_t = xings[k].ti;
-        events[si_strand][ni].xing_idx = k;
-        events[si_strand][ni].is_over = over_first ? 1 : 0;
-
-        int nj = n_events[sj_strand]++;
-        events[sj_strand][nj].sort_key_seg = sj_seg;
-        events[sj_strand][nj].sort_key_t = xings[k].tj;
-        events[sj_strand][nj].xing_idx = k;
-        events[sj_strand][nj].is_over = over_first ? 0 : 1;
-    }
-
-    /* Sort events per strand by (segment, t) */
-    for (int si = 0; si < sg->n_strands; si++) {
-        int n = n_events[si];
-        for (int i = 0; i < n-1; i++)
-            for (int j = i+1; j < n; j++) {
-                StrandEvent *a = &events[si][i], *b = &events[si][j];
-                if (a->sort_key_seg > b->sort_key_seg ||
-                    (a->sort_key_seg == b->sort_key_seg && a->sort_key_t > b->sort_key_t)) {
-                    StrandEvent tmp = *a; *a = *b; *b = tmp;
-                }
-            }
-    }
-
-    /* Build diagram edges */
-    DiagramEdge dedges[MAX_DIAGRAM_EDGES];
-    int n_dedges = 0;
-    for (int si = 0; si < sg->n_strands; si++) {
-        /* Chain: V(start) -> X0 -> X1 -> ... -> V(end) */
-        DiagramEndpoint prev;
-        prev.is_vertex = 1; prev.id = sg->strand_endv[si * 2]; prev.port = 0;
-
-        for (int ei = 0; ei < n_events[si] && n_dedges < MAX_DIAGRAM_EDGES; ei++) {
-            StrandEvent *ev = &events[si][ei];
-            int role = ev->is_over; /* 1=over, 0=under */
-            /* Incoming port: over_in(1) or under_in(3) */
-            int port_in = role ? slot[ev->xing_idx][1] : slot[ev->xing_idx][3];
-            DiagramEndpoint cur;
-            cur.is_vertex = 0; cur.id = ev->xing_idx; cur.port = port_in;
-            dedges[n_dedges].a = prev;
-            dedges[n_dedges].b = cur;
-            n_dedges++;
-            /* Outgoing: over_out(0) or under_out(2) */
-            prev.is_vertex = 0; prev.id = ev->xing_idx;
-            prev.port = role ? slot[ev->xing_idx][0] : slot[ev->xing_idx][2];
+    /* Diagram edges */
+    DiagramEdge de[MAX_DIAGRAM_EDGES];
+    int nde = 0;
+    for (int s = 0; s < sg->n_strands; s++) {
+        DiagramEndpoint prev = {1, sg->strand_endv[s*2], 0};
+        for (int i = 0; i < nev[s]; i++) {
+            Ev *e = &ev[s][i];
+            DiagramEndpoint cur = {0, e->k, e->over ? slot[e->k][1] : slot[e->k][3]};
+            de[nde++] = (DiagramEdge){prev, cur};
+            prev = (DiagramEndpoint){0, e->k, e->over ? slot[e->k][0] : slot[e->k][2]};
         }
-        /* Final edge to end vertex */
-        if (n_dedges < MAX_DIAGRAM_EDGES) {
-            DiagramEndpoint end;
-            end.is_vertex = 1; end.id = sg->strand_endv[si * 2 + 1]; end.port = 0;
-            dedges[n_dedges].a = prev;
-            dedges[n_dedges].b = end;
-            n_dedges++;
-        }
+        DiagramEndpoint end = {1, sg->strand_endv[s*2+1], 0};
+        de[nde++] = (DiagramEdge){prev, end};
     }
 
-    /* ---- Skein resolution: sum over 3^n_xings states ---- */
+    /* Skein sum over 3^nx states, parallel with per-thread memo */
     long long n_states = 1;
-    for (int i = 0; i < n_xings; i++) n_states *= 3;
+    for (int i = 0; i < nx; i++) n_states *= 3;
+    g_last_states = n_states;
+    g_last_hits = g_last_misses = 0;
+    poly_set_zero(total);
 
-    LPoly total = POLY_ZERO;
-    for (long long state_id = 0; state_id < n_states; state_id++) {
-        int st[MAX_CROSSINGS];
-        long long sid = state_id;
-        int exp = 0;
-        for (int i = 0; i < n_xings; i++) {
-            st[i] = (int)(sid % 3); sid /= 3;
-        }
-        for (int i = 0; i < n_xings; i++) {
-            if (st[i] == 0) exp++;
-            else if (st[i] == 1) exp--;
-        }
+    #pragma omp parallel if(n_states >= 729)
+    {
+        Memo *memo = memo_new();
+        LPoly local; poly_set_zero(&local);
 
-        /* Build vertex mapping: xmap[k][port] -> vertex id */
-        int xmap[MAX_CROSSINGS][4];
-        int next_id = nV;
-        for (int k = 0; k < n_xings; k++) {
-            if (st[k] == 2) {
-                /* 4-valent vertex */
-                int v = next_id++;
-                xmap[k][0] = xmap[k][1] = xmap[k][2] = xmap[k][3] = v;
-            } else if (st[k] == 0) {
-                /* A-smoothing: (0,3) and (1,2) */
-                int v1 = next_id++, v2 = next_id++;
-                xmap[k][0] = v1; xmap[k][3] = v1;
-                xmap[k][1] = v2; xmap[k][2] = v2;
-            } else {
-                /* B-smoothing: (0,1) and (2,3) */
-                int v1 = next_id++, v2 = next_id++;
-                xmap[k][0] = v1; xmap[k][1] = v1;
-                xmap[k][2] = v2; xmap[k][3] = v2;
+        #pragma omp for schedule(dynamic, 32)
+        for (long long sid0 = 0; sid0 < n_states; sid0++) {
+            int st[MAX_CROSSINGS];
+            long long sid = sid0; int exp = 0;
+            for (int i = 0; i < nx; i++) { st[i] = (int)(sid % 3); sid /= 3; exp += (st[i]==0) - (st[i]==1); }
+
+            int xmap[MAX_CROSSINGS][4], next_id = nV;
+            for (int k = 0; k < nx; k++) {
+                if (st[k] == 2) { int v = next_id++; xmap[k][0]=xmap[k][1]=xmap[k][2]=xmap[k][3]=v; }
+                else if (st[k] == 0) { int v1 = next_id++, v2 = next_id++; xmap[k][0]=xmap[k][3]=v1; xmap[k][1]=xmap[k][2]=v2; }
+                else { int v1 = next_id++, v2 = next_id++; xmap[k][0]=xmap[k][1]=v1; xmap[k][2]=xmap[k][3]=v2; }
             }
+            Edge g[MAX_DIAGRAM_EDGES];
+            for (int i = 0; i < nde; i++) {
+                g[i].u = de[i].a.is_vertex ? de[i].a.id : xmap[de[i].a.id][de[i].a.port];
+                g[i].v = de[i].b.is_vertex ? de[i].b.id : xmap[de[i].b.id][de[i].b.port];
+            }
+            LPoly val, term;
+            graph_R(memo, next_id, g, nde, &val);
+            poly_scale_mono(&val, exp, 1, &term);
+            poly_add_inplace(&local, &term);
         }
 
-        /* Build graph edges from diagram edges */
-        Edge g_edges[MAX_DIAGRAM_EDGES];
-        int ng = 0;
-        for (int i = 0; i < n_dedges; i++) {
-            int va, vb;
-            if (dedges[i].a.is_vertex) va = dedges[i].a.id;
-            else va = xmap[dedges[i].a.id][dedges[i].a.port];
-            if (dedges[i].b.is_vertex) vb = dedges[i].b.id;
-            else vb = xmap[dedges[i].b.id][dedges[i].b.port];
-            g_edges[ng].u = va; g_edges[ng].v = vb; ng++;
+        #pragma omp critical
+        {
+            poly_add_inplace(total, &local);
+            g_last_hits += memo->hits; g_last_misses += memo->misses;
         }
-
-        LPoly val = graph_R(next_id, g_edges, ng);
-        LPoly term = poly_scale_mono(&val, exp, 1);
-        total = poly_add(&total, &term);
+        memo_free(memo);
     }
-
-    return total;
 }
 
 /* ========================================================================
- * 5. Public API: Yamada polynomial of a spatial graph
+ * 6. Public API
  * ======================================================================== */
 
-/* Random rotation via QR decomposition (simplified: Householder). */
-static void random_rotation(double *rot, unsigned long long *rng_state) {
-    /* Simple xorshift64* RNG */
+static void random_rotation(double *R, unsigned long long *s) {
     double M[9];
     for (int i = 0; i < 9; i++) {
-        *rng_state ^= *rng_state >> 12;
-        *rng_state ^= *rng_state << 25;
-        *rng_state ^= *rng_state >> 27;
-        unsigned long long x = *rng_state * 0x2545F4914F6CDD1DULL;
+        *s ^= *s >> 12; *s ^= *s << 25; *s ^= *s >> 27;
+        unsigned long long x = *s * 0x2545F4914F6CDD1DULL;
         M[i] = ((double)(x >> 11)) / (double)(1ULL << 53) * 2.0 - 1.0;
     }
-    /* Gram-Schmidt to get orthonormal basis */
-    double *r0 = rot, *r1 = rot+3, *r2 = rot+6;
-    double n;
-    /* Row 0 */
+    double *r0 = R, *r1 = R+3, *r2 = R+6, n, d;
     r0[0]=M[0]; r0[1]=M[1]; r0[2]=M[2];
-    n = sqrt(r0[0]*r0[0]+r0[1]*r0[1]+r0[2]*r0[2]);
-    if (n < 1e-10) { r0[0]=1; r0[1]=r0[2]=0; n=1; }
+    n = sqrt(r0[0]*r0[0]+r0[1]*r0[1]+r0[2]*r0[2]); if (n < 1e-10) { r0[0]=1; r0[1]=r0[2]=0; n=1; }
     r0[0]/=n; r0[1]/=n; r0[2]/=n;
-    /* Row 1: orthogonalize to row 0 */
     r1[0]=M[3]; r1[1]=M[4]; r1[2]=M[5];
-    double d = r1[0]*r0[0]+r1[1]*r0[1]+r1[2]*r0[2];
+    d = r1[0]*r0[0]+r1[1]*r0[1]+r1[2]*r0[2];
     r1[0]-=d*r0[0]; r1[1]-=d*r0[1]; r1[2]-=d*r0[2];
-    n = sqrt(r1[0]*r1[0]+r1[1]*r1[1]+r1[2]*r1[2]);
-    if (n < 1e-10) { r1[0]=0; r1[1]=1; r1[2]=0; n=1; }
+    n = sqrt(r1[0]*r1[0]+r1[1]*r1[1]+r1[2]*r1[2]); if (n < 1e-10) { r1[0]=0; r1[1]=1; r1[2]=0; n=1; }
     r1[0]/=n; r1[1]/=n; r1[2]/=n;
-    /* Row 2: cross product */
-    r2[0]=r0[1]*r1[2]-r0[2]*r1[1];
-    r2[1]=r0[2]*r1[0]-r0[0]*r1[2];
-    r2[2]=r0[0]*r1[1]-r0[1]*r1[0];
+    r2[0]=r0[1]*r1[2]-r0[2]*r1[1]; r2[1]=r0[2]*r1[0]-r0[0]*r1[2]; r2[2]=r0[0]*r1[1]-r0[1]*r1[0];
 }
 
-/* Compute Yamada polynomial of strands.
- * strands: array of 3D polyline points, concatenated.
- * strand_lens: number of points per strand.
- * n_strands: number of strands.
- * tol: endpoint coincidence tolerance.
- * tries: number of random projections to try.
- * seed: RNG seed.
- * result: output polynomial.
- * Returns number of crossings in best projection, or -1 on failure. */
-int yamada_polynomial(const double *strands, const int *strand_lens, int n_strands,
-                      double tol, int tries, unsigned long long seed,
-                      LPoly *result, int *n_crossings_out) {
-    /* Build spatial graph */
-    SpatialGraph sg;
-    sg.n_strands = n_strands;
-    int total_pts = 0;
-    for (int si = 0; si < n_strands; si++) {
-        sg.strand_start[si] = total_pts;
-        sg.strand_len[si] = strand_lens[si];
-        for (int k = 0; k < strand_lens[si]; k++) {
-            sg.points[(total_pts + k) * 3 + 0] = strands[(total_pts + k) * 3 + 0];
-            sg.points[(total_pts + k) * 3 + 1] = strands[(total_pts + k) * 3 + 1];
-            sg.points[(total_pts + k) * 3 + 2] = strands[(total_pts + k) * 3 + 2];
-        }
-        total_pts += strand_lens[si];
-    }
+/* Returns crossings in best projection (>= 0),
+ * -1: no generic projection found, -2: every projection exceeds max_crossings,
+ * -3: input too large for compiled limits. */
+static int yamada_polynomial(const double *strands, const int *strand_lens, int n_strands,
+                             double tol, int tries, unsigned long long seed, int max_crossings,
+                             LPoly *result) {
+    if (n_strands > MAX_STRANDS) return -3;
+    if (max_crossings > MAX_CROSSINGS) max_crossings = MAX_CROSSINGS;
 
-    /* Identify graph vertices (coincident endpoints) */
+    SpatialGraph sg; sg.n_strands = n_strands;
+    int total = 0;
+    for (int si = 0; si < n_strands; si++) {
+        if (total + strand_lens[si] > MAX_POINTS) return -3;
+        sg.strand_start[si] = total; sg.strand_len[si] = strand_lens[si];
+        memcpy(sg.points + total*3, strands + total*3, (size_t)strand_lens[si]*3*sizeof(double));
+        total += strand_lens[si];
+    }
     sg.n_vertices = 0;
-    double verts[MAX_POINTS * 3];
-    for (int si = 0; si < n_strands; si++) {
-        for (int ep = 0; ep < 2; ep++) {
-            int pidx = sg.strand_start[si] + (ep ? sg.strand_len[si] - 1 : 0);
-            const double *p = sg.points + pidx * 3;
-            int found = -1;
-            for (int vi = 0; vi < sg.n_vertices; vi++) {
-                double dx = p[0]-verts[vi*3], dy = p[1]-verts[vi*3+1], dz = p[2]-verts[vi*3+2];
-                if (sqrt(dx*dx+dy*dy+dz*dz) < tol) { found = vi; break; }
-            }
-            if (found < 0) {
-                found = sg.n_vertices;
-                verts[found*3]=p[0]; verts[found*3+1]=p[1]; verts[found*3+2]=p[2];
-                sg.n_vertices++;
-            }
-            sg.strand_endv[si * 2 + ep] = found;
+    for (int si = 0; si < n_strands; si++) for (int ep = 0; ep < 2; ep++) {
+        const double *p = sg.points + (sg.strand_start[si] + (ep ? sg.strand_len[si]-1 : 0))*3;
+        int found = -1;
+        for (int vi = 0; vi < sg.n_vertices; vi++) {
+            double *q = sg.vertices + vi*3;
+            double dx=p[0]-q[0], dy=p[1]-q[1], dz=p[2]-q[2];
+            if (dx*dx+dy*dy+dz*dz < tol*tol) { found = vi; break; }
         }
+        if (found < 0) { found = sg.n_vertices++; memcpy(sg.vertices + found*3, p, 3*sizeof(double)); }
+        sg.strand_endv[si*2+ep] = found;
     }
-    memcpy(sg.vertices, verts, (size_t)(sg.n_vertices * 3) * sizeof(double));
 
-    /* Build segments */
-    double seg6[MAX_SEGMENTS * 6];
-    int meta3[MAX_SEGMENTS * 3], seg_loc2[MAX_SEGMENTS * 2];
+    double seg6[MAX_SEGMENTS*6], rseg[MAX_SEGMENTS*6], best_rseg[MAX_SEGMENTS*6];
+    int meta3[MAX_SEGMENTS*3], seg_loc2[MAX_SEGMENTS*2];
     int n_seg = build_segments(&sg, tol, seg6, meta3, seg_loc2);
 
-    /* Try projections */
-    double rot_seg[MAX_SEGMENTS * 6];
-    CrossingRecord xings[MAX_CROSSINGS];
-    int best_nx = -1;
-    CrossingRecord best_xings[MAX_CROSSINGS];
-    double best_rot_seg[MAX_SEGMENTS * 6];
+    CrossingRecord xg[MAX_CROSSINGS], best_x[MAX_CROSSINGS];
+    int best_nx = -1, saw_cap = 0;
     unsigned long long rng = seed ? seed : 42;
 
     for (int trial = 0; trial < tries; trial++) {
-        double rot[9];
-        if (trial == 0) {
-            /* Identity */
-            memset(rot, 0, sizeof(rot));
-            rot[0] = rot[4] = rot[8] = 1.0;
-        } else {
-            random_rotation(rot, &rng);
-        }
-        rotate_segments(seg6, rot_seg, n_seg, rot);
-
-        /* Check graph vertices don't project onto crossings */
-        int nx = find_crossings(rot_seg, meta3, n_seg, xings);
+        double R[9] = {1,0,0, 0,1,0, 0,0,1};
+        if (trial > 0) random_rotation(R, &rng);
+        rotate_segments(seg6, rseg, n_seg, R);
+        int cap = (best_nx < 0) ? max_crossings : MIN(best_nx, max_crossings);
+        int nx = find_crossings(rseg, meta3, n_seg, xg, cap);
+        if (nx == -2) { saw_cap = 1; continue; }
         if (nx < 0) continue;
-
-        /* Check graph vertex proximity to crossings */
         int bad = 0;
         for (int vi = 0; vi < sg.n_vertices && !bad; vi++) {
-            double *v = sg.vertices + vi * 3;
-            double vr[2] = {
-                v[0]*rot[0]+v[1]*rot[1]+v[2]*rot[2],
-                v[0]*rot[3]+v[1]*rot[4]+v[2]*rot[5]
-            };
+            double *v = sg.vertices + vi*3;
+            double vx = v[0]*R[0]+v[1]*R[1]+v[2]*R[2], vy = v[0]*R[3]+v[1]*R[4]+v[2]*R[5];
             for (int k = 0; k < nx; k++) {
-                double dx = vr[0]-xings[k].px, dy = vr[1]-xings[k].py;
+                double dx = vx-xg[k].px, dy = vy-xg[k].py;
                 if (dx*dx+dy*dy < 1e-12) { bad = 1; break; }
             }
         }
         if (bad) continue;
-
         if (best_nx < 0 || nx < best_nx) {
             best_nx = nx;
-            memcpy(best_xings, xings, (size_t)nx * sizeof(CrossingRecord));
-            memcpy(best_rot_seg, rot_seg, (size_t)(n_seg * 6) * sizeof(double));
+            memcpy(best_x, xg, (size_t)nx*sizeof(CrossingRecord));
+            memcpy(best_rseg, rseg, (size_t)n_seg*6*sizeof(double));
         }
         if (best_nx <= 2) break;
     }
+    if (best_nx < 0) return saw_cap ? -2 : -1;
 
-    if (best_nx < 0) return -1;
-
-    *n_crossings_out = best_nx;
-    memo_clear();
-    *result = build_and_resolve(&sg, best_xings, best_nx, best_rot_seg, seg_loc2, n_seg, n_crossings_out);
+    build_and_resolve(&sg, best_x, best_nx, best_rseg, seg_loc2, result);
     return best_nx;
 }
 
-/* ========================================================================
- * 6. Ctypes entry points
- * ======================================================================== */
+/* ---- ctypes entry points ---- */
 
-/* Compute Yamada polynomial for one set of strands.
- * Input: flat array of 3D points, strand lengths, parameters.
- * Output: polynomial coefficients written to out_coeff[POLY_SIZE],
- *         with out_coeff[i] = coefficient of A^(i-MAX_EXP).
- * Returns number of crossings, or -1 on failure. */
-int compute_yamada(const double *strand_points, const int *strand_lens,
-                   int n_strands, double tol, int tries, unsigned long long seed,
+int compute_yamada(const double *strand_points, const int *strand_lens, int n_strands,
+                   double tol, int tries, unsigned long long seed, int max_crossings,
                    int *out_coeff, int *out_n_crossings) {
-    LPoly poly;
-    int nx;
-    int ret = yamada_polynomial(strand_points, strand_lens, n_strands,
-                                tol, tries, seed, &poly, &nx);
-    if (ret < 0) {
-        memset(out_coeff, 0, POLY_SIZE * sizeof(int));
-        *out_n_crossings = 0;
-        return -1;
-    }
-    LPoly norm = poly_normalize(&poly);
-    memcpy(out_coeff, norm.coeff, POLY_SIZE * sizeof(int));
-    *out_n_crossings = nx;
+    LPoly poly, norm;
+    g_overflow = 0;
+    int ret = yamada_polynomial(strand_points, strand_lens, n_strands, tol, tries, seed,
+                                max_crossings, &poly);
+    memset(out_coeff, 0, POLY_SIZE * sizeof(int));
+    *out_n_crossings = ret >= 0 ? ret : 0;
+    if (ret < 0) return ret;
+    poly_normalize(&poly, &norm);
+    for (int e = norm.lo; e <= norm.hi; e++) out_coeff[e + OFFSET] = norm.c[e + OFFSET];
     return ret;
 }
 
-/* Get POLY_SIZE and OFFSET constants for the Python caller. */
-int get_poly_size(void) { return POLY_SIZE; }
-int get_offset(void) { return OFFSET; }
-
-/* Clear the memoization cache. Call between cells. */
-void clear_memo(void) { memo_clear(); }
+int  get_poly_size(void)      { return POLY_SIZE; }
+int  get_offset(void)         { return OFFSET; }
+int  get_max_crossings(void)  { return MAX_CROSSINGS; }
+int  get_overflow_flag(void)  { return g_overflow; }
+long long get_last_states(void) { return g_last_states; }
+long long get_last_hits(void)   { return g_last_hits; }
+long long get_last_misses(void) { return g_last_misses; }
+int  has_openmp(void) {
+#ifdef _OPENMP
+    return 1;
+#else
+    return 0;
+#endif
+}
+void set_num_threads(int n) {
+#ifdef _OPENMP
+    if (n > 0) omp_set_num_threads(n);
+#else
+    (void)n;
+#endif
+}
+/* Kept for API compatibility; memo is now per-call. */
+void clear_memo(void) {}
