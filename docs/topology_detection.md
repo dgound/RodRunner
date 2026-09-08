@@ -5,6 +5,23 @@ uses calibrated `replication_qc_v3` locus calls and the merged drift-corrected
 full-coverage one-spot coordinate CSV. It never changes a spot call, fills a
 missing locus, or moves a measured coordinate.
 
+The detector is a single Python orchestrator over one C library,
+`pipeline/topology_engine.so`, which holds every numeric step: theta-pattern
+classification, global sister assignment, strand and loop validation, the
+Yamada polynomial (skein resolution with OpenMP over states), and the classical
+linking number. Build it once next to the script:
+
+```bash
+gcc -O3 -fopenmp -shared -fPIC -o pipeline/topology_engine.so pipeline/topology_engine.c -lm
+```
+
+Input CSVs are streamed in row chunks (`--chunk-rows`, default 100000): a file
+with fewer rows loads as a single chunk, larger files never hold more than one
+chunk of compact tuples. Only the columns needed are kept, and coordinates and
+fitter evidence are retained only for walks that can reach a topology
+calculation, so memory is set by the candidate count, not by the size of the
+comprehensive evidence file.
+
 ## Configuration
 
 The detector is not tied to a dataset registry. Any dataset can supply a small
@@ -44,9 +61,14 @@ python pipeline/detect_topology.py \
   --coordinates-csv /path/to/publication_v1_trace_salvage_full_schema.csv \
   --config /path/to/dataset.json \
   --reduction-manifest /path/to/publication_v1_manifest.json \
-  --outdir /path/to/topology \
-  --yamada-path /mnt/altnas/work/dimos/Yamada
+  --outdir /path/to/topology
 ```
+
+`--max-crossings` (default 16) bounds the skein resolution: a theta whose best
+projection over all seeds needs more crossings is written with status
+`theta_crossings_exceeded` and blank polynomial fields, but its reconstructed
+strand points are still emitted. `--threads` sets the OpenMP thread count; under
+SLURM it defaults to `SLURM_CPUS_PER_TASK`.
 
 For exploratory work on an existing unfiltered trace-salvage full-schema CSV,
 the publication-v1 reduction is optional:
@@ -136,27 +158,11 @@ Exactly five files are written:
 - `topology_manifest.json`: input hashes, coordinate transform, policies, row
   counts, and candidate counts.
 
-To load theta coordinates in the exact form expected by Yamada:
-
-```python
-from pipeline.topology_io import load_theta_yamada
-
-strands = load_theta_yamada(
-    "/path/to/theta_strand_points.csv", "theta:dataset:Location-01:42"
-)
-# strands == [unreplicated_xyz, sister_A_xyz, sister_B_xyz]
-```
-
-To reconstruct a link in 3D:
-
-```python
-from pipeline.topology_io import load_link_loops
-
-loop_a, loop_b = load_link_loops(
-    "/path/to/link_loop_points.csv", "link:dataset:Location-01:42"
-)
-# Each returned array explicitly repeats vertex zero at the end.
-```
+To reconstruct one theta graph, filter `theta_strand_points.csv` on `GraphID`
+and group by `StrandID` in `PointOrder`; the three strands share their first
+and last rows exactly. To reconstruct a link, filter `link_loop_points.csv` on
+`LinkID`, group by `LoopID` in `PointOrder`, and append vertex zero to close
+each loop.
 
 The CSV coordinate order is always `XNm, YNm, ZNm`. Two-component raw-pixel
 centres are transformed with

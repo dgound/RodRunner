@@ -3,11 +3,12 @@ import ctypes, os, sys, time
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-lib = ctypes.CDLL(os.path.join(HERE, 'pipeline', 'topology_engine.so'))
+lib = ctypes.CDLL(os.environ.get('TOPOLOGY_ENGINE_SO', os.path.join(HERE, 'pipeline', 'topology_engine.so')))
 lib.compute_yamada.restype = ctypes.c_int
 lib.compute_yamada.argtypes = [
     ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
     ctypes.c_double, ctypes.c_int, ctypes.c_ulonglong, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
     ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
 for name in ('get_poly_size', 'get_offset', 'get_max_crossings', 'get_overflow_flag', 'has_openmp'):
     getattr(lib, name).restype = ctypes.c_int
@@ -23,12 +24,14 @@ from yamada import yamada, normalize, p_str
 def c_yamada(strands, tol=1e-6, tries=60, seed=42, max_crossings=20):
     pts = np.ascontiguousarray(np.vstack(strands), dtype=np.float64)
     lens = np.array([len(s) for s in strands], dtype=np.int32)
+    raw = (ctypes.c_int * POLY_SIZE)()
     out = (ctypes.c_int * POLY_SIZE)()
-    nx = ctypes.c_int(0)
+    nx, nv = ctypes.c_int(0), ctypes.c_int(0)
     t0 = time.time()
     ret = lib.compute_yamada(pts.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
                              lens.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-                             len(strands), tol, tries, seed, max_crossings, out, ctypes.byref(nx))
+                             len(strands), tol, tries, seed, max_crossings, raw, out,
+                             ctypes.byref(nx), ctypes.byref(nv))
     dt = time.time() - t0
     poly = {i - OFFSET: out[i] for i in range(POLY_SIZE) if out[i]}
     return ret, nx.value, poly, dt

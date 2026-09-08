@@ -4,20 +4,21 @@ import json
 import math
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 
-from pipeline.detect_topology import TopologyDetectionError, detect
-from pipeline.topology_io import load_link_loops, load_theta_yamada
+PIPELINE = Path(__file__).resolve().parents[1] / "pipeline"
+sys.path.insert(0, str(PIPELINE))
+from detect_topology import ENGINE_SO, TopologyDetectionError, detect  # noqa: E402
 
 
-YAMADA = Path("/mnt/altnas/work/dimos/Yamada")
 ORDER = tuple(f"TP{i:03d}" for i in range(6))
 
 
 class DetectTopologyTest(unittest.TestCase):
     def setUp(self):
-        if not (YAMADA / "yamada.py").is_file():
-            self.skipTest("Yamada checkout unavailable")
+        if not ENGINE_SO.is_file():
+            self.skipTest(f"{ENGINE_SO} not built")
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.config = self.root / "config.json"
@@ -166,18 +167,26 @@ class DetectTopologyTest(unittest.TestCase):
             locus_results=loci, coordinates_csv=coordinates,
             config_path=self.config, reduction_manifest=self.reduction_manifest,
             output_dir=self.root / "out",
-            yamada_path=YAMADA, yamada_seeds=(0, 1), yamada_tries=20,
+            yamada_seeds=(0, 1), yamada_tries=20,
             link_projections=32)
-        strands = load_theta_yamada(paths["theta_points"],
-                                     "theta:new-dataset:FOV-A:7")
-        self.assertEqual([array.shape[1] for array in strands], [3, 3, 3])
-        self.assertTrue(all((array[0] == strands[0][0]).all() for array in strands))
-        self.assertTrue(all((array[-1] == strands[0][-1]).all() for array in strands))
-        loop_a, loop_b = load_link_loops(paths["link_points"],
-                                         "link:new-dataset:FOV-A:9")
-        self.assertEqual(loop_a.shape, (7, 3))
-        self.assertEqual(loop_b.shape, (7, 3))
-        self.assertTrue((loop_a[0] == loop_a[-1]).all())
+        _, theta_points = self._read(paths["theta_points"])
+        strands = {}
+        for row in theta_points:
+            self.assertEqual(row["GraphID"], "theta:new-dataset:FOV-A:7")
+            strands.setdefault(row["StrandID"], []).append(
+                (row["XNm"], row["YNm"], row["ZNm"]))
+        self.assertEqual(sorted(strands), ["sister_A", "sister_B", "unreplicated"])
+        for points in strands.values():
+            self.assertEqual(points[0], strands["unreplicated"][0])
+            self.assertEqual(points[-1], strands["unreplicated"][-1])
+        _, link_points = self._read(paths["link_points"])
+        loops = {}
+        for row in link_points:
+            self.assertEqual(row["LinkID"], "link:new-dataset:FOV-A:9")
+            self.assertEqual(row["Closed"], "1")
+            loops.setdefault(row["LoopID"], []).append(row["TP"])
+        self.assertEqual(loops["sister_A"], list(ORDER))
+        self.assertEqual(loops["sister_B"], list(ORDER))
         manifest = json.loads(paths["manifest"].read_text())
         self.assertEqual(manifest["provenance"]["walks_total"], 2)
         self.assertEqual(manifest["provenance"]["theta_candidates"], 1)
@@ -241,7 +250,7 @@ class DetectTopologyTest(unittest.TestCase):
         paths = detect(
             locus_results=legacy, coordinates_csv=legacy,
             config_path=self.config, reduction_manifest=None,
-            output_dir=self.root / "legacy-out", yamada_path=YAMADA,
+            output_dir=self.root / "legacy-out",
             evidence_mode="legacy-full-schema",
             evaluate_yamada_polynomial=False, link_projections=16)
         manifest = json.loads(paths["manifest"].read_text())["provenance"]
@@ -258,14 +267,12 @@ class DetectTopologyTest(unittest.TestCase):
         with self.assertRaisesRegex(TopologyDetectionError, "unexpected v3_schema"):
             detect(locus_results=loci, coordinates_csv=coordinates,
                    config_path=self.config, reduction_manifest=self.reduction_manifest,
-                   output_dir=self.root / "bad-v2",
-                   yamada_path=YAMADA)
+                   output_dir=self.root / "bad-v2")
         loci, coordinates = self._inputs(duplicate=True)
         with self.assertRaisesRegex(TopologyDetectionError, "duplicate locus key"):
             detect(locus_results=loci, coordinates_csv=coordinates,
                    config_path=self.config, reduction_manifest=self.reduction_manifest,
-                   output_dir=self.root / "duplicate",
-                   yamada_path=YAMADA)
+                   output_dir=self.root / "duplicate")
 
     def test_underpowered_non_discovery_does_not_complete_theta(self):
         loci, coordinates = self._inputs()
@@ -281,7 +288,7 @@ class DetectTopologyTest(unittest.TestCase):
             locus_results=loci, coordinates_csv=coordinates,
             config_path=self.config, reduction_manifest=self.reduction_manifest,
             output_dir=self.root / "underpowered",
-            yamada_path=YAMADA, yamada_seeds=(0,), yamada_tries=10,
+            yamada_seeds=(0,), yamada_tries=10,
             link_projections=16)
         _, summaries = self._read(paths["theta_summary"])
         self.assertEqual(summaries[0]["ThetaStatus"], "pattern_not_traceable")
@@ -296,8 +303,7 @@ class DetectTopologyTest(unittest.TestCase):
         with self.assertRaisesRegex(TopologyDetectionError, "must be 'final'"):
             detect(locus_results=loci, coordinates_csv=coordinates,
                    config_path=self.config, reduction_manifest=self.reduction_manifest,
-                   output_dir=self.root / "provisional",
-                   yamada_path=YAMADA)
+                   output_dir=self.root / "provisional")
 
         loci, coordinates = self._inputs()
         fields, rows = self._read(coordinates)
@@ -306,8 +312,7 @@ class DetectTopologyTest(unittest.TestCase):
         with self.assertRaisesRegex(TopologyDetectionError, "partially populated"):
             detect(locus_results=loci, coordinates_csv=coordinates,
                    config_path=self.config, reduction_manifest=self.reduction_manifest,
-                   output_dir=self.root / "partial",
-                   yamada_path=YAMADA)
+                   output_dir=self.root / "partial")
 
     def test_manifest_and_coordinate_source_are_bound(self):
         loci, coordinates = self._inputs()
@@ -317,7 +322,7 @@ class DetectTopologyTest(unittest.TestCase):
         with self.assertRaisesRegex(TopologyDetectionError, "thresholds differ"):
             detect(locus_results=loci, coordinates_csv=coordinates,
                    config_path=self.config, reduction_manifest=self.reduction_manifest,
-                   output_dir=self.root / "wrong-policy", yamada_path=YAMADA)
+                   output_dir=self.root / "wrong-policy")
 
         loci, coordinates = self._inputs()
         fields, rows = self._read(coordinates)
@@ -328,8 +333,7 @@ class DetectTopologyTest(unittest.TestCase):
         paths = detect(locus_results=loci, coordinates_csv=coordinates,
                        config_path=self.config,
                        reduction_manifest=self.reduction_manifest,
-                       output_dir=self.root / "wrong-coordinates",
-                       yamada_path=YAMADA)
+                       output_dir=self.root / "wrong-coordinates")
         _, summaries = self._read(paths["theta_summary"])
         theta = next(row for row in summaries if row["WalkID"] == "7")
         self.assertEqual(theta["ThetaStatus"], "geometry_incomplete")
@@ -353,7 +357,7 @@ class DetectTopologyTest(unittest.TestCase):
         paths = detect(
             locus_results=loci, coordinates_csv=coordinates,
             config_path=self.config, reduction_manifest=self.reduction_manifest,
-            output_dir=self.root / "manifest-only", yamada_path=YAMADA,
+            output_dir=self.root / "manifest-only",
             yamada_seeds=(0,), yamada_tries=10, link_projections=16)
         _, summaries = self._read(paths["theta_summary"])
         self.assertEqual(summaries[0]["ThetaStatus"], "pattern_not_traceable")
