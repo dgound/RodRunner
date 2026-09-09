@@ -1177,6 +1177,82 @@ int link_perturbation(const double *loop_a, int na, const double *loop_b, int nb
     return 0;
 }
 
+/* ========================================================================
+ * 12. Perturbation stability of a theta graph's Yamada polynomial.
+ *     Observed loci (single-copy path, sister A, sister B) are re-drawn with
+ *     Gaussian noise, the two fork vertices are recomputed from the perturbed
+ *     neighbours (boundary-midpoint or pair-midpoint model), the strands are
+ *     validated and the normalized polynomial recomputed and compared with
+ *     `nominal_norm` (POLY_SIZE coefficients). Draws failing validation or
+ *     without a generic projection count in *n_invalid; draws above the
+ *     crossing cap count in *n_unknown; neither counts as agreement.
+ * ======================================================================== */
+
+static void midpoint3(const double *a, const double *b, double *out) {
+    for (int d = 0; d < 3; d++) out[d] = (a[d] + b[d]) / 2.0;
+}
+
+int theta_perturbation(const double *singles, int n_single,
+                       const double *sister_a, const double *sister_b, int n_double,
+                       int boundary_midpoint, double tol, int tries,
+                       unsigned long long seed, int max_crossings,
+                       int draws, double sigma_xy, double sigma_z,
+                       const int *nominal_norm,
+                       int *n_agree, int *n_invalid, int *n_unknown) {
+    if (n_single < 1 || n_double < 1 || n_single + 2 * n_double + 6 > MAX_POINTS) return -30;
+    if (draws < 1) return -31;
+    double S[MAX_POINTS*3], A[MAX_POINTS*3], B[MAX_POINTS*3];
+    double pts[MAX_POINTS*3];
+    int lens[3] = {n_single + 2, n_double + 2, n_double + 2};
+    unsigned long long rng = seed ? seed : 0x9E3779B97F4A7C15ULL;
+    *n_agree = 0; *n_invalid = 0; *n_unknown = 0;
+    for (int d = 0; d < draws; d++) {
+        for (int i = 0; i < n_single; i++) {
+            S[i*3]   = singles[i*3]   + sigma_xy * gaussian(&rng);
+            S[i*3+1] = singles[i*3+1] + sigma_xy * gaussian(&rng);
+            S[i*3+2] = singles[i*3+2] + sigma_z  * gaussian(&rng);
+        }
+        for (int i = 0; i < n_double; i++) {
+            A[i*3]   = sister_a[i*3]   + sigma_xy * gaussian(&rng);
+            A[i*3+1] = sister_a[i*3+1] + sigma_xy * gaussian(&rng);
+            A[i*3+2] = sister_a[i*3+2] + sigma_z  * gaussian(&rng);
+            B[i*3]   = sister_b[i*3]   + sigma_xy * gaussian(&rng);
+            B[i*3+1] = sister_b[i*3+1] + sigma_xy * gaussian(&rng);
+            B[i*3+2] = sister_b[i*3+2] + sigma_z  * gaussian(&rng);
+        }
+        double f1[3], f2[3], m1[3], m2[3];
+        midpoint3(A, B, m1);
+        midpoint3(A + (n_double-1)*3, B + (n_double-1)*3, m2);
+        if (boundary_midpoint) { midpoint3(m1, S, f1); midpoint3(m2, S + (n_single-1)*3, f2); }
+        else { memcpy(f1, m1, sizeof f1); memcpy(f2, m2, sizeof f2); }
+        int k = 0;
+        memcpy(pts + (k++)*3, f1, 3*sizeof(double));
+        for (int i = 0; i < n_single; i++) memcpy(pts + (k++)*3, S + i*3, 3*sizeof(double));
+        memcpy(pts + (k++)*3, f2, 3*sizeof(double));
+        memcpy(pts + (k++)*3, f1, 3*sizeof(double));
+        for (int i = 0; i < n_double; i++) memcpy(pts + (k++)*3, A + i*3, 3*sizeof(double));
+        memcpy(pts + (k++)*3, f2, 3*sizeof(double));
+        memcpy(pts + (k++)*3, f1, 3*sizeof(double));
+        for (int i = 0; i < n_double; i++) memcpy(pts + (k++)*3, B + i*3, 3*sizeof(double));
+        memcpy(pts + (k++)*3, f2, 3*sizeof(double));
+        int which;
+        if (validate_theta_strands(pts, lens, 3, tol, &which) != 0) { (*n_invalid)++; continue; }
+        LPoly poly, norm;
+        int ret = yamada_polynomial(pts, lens, 3, tol, tries, seed + 1 + (unsigned long long)d,
+                                    max_crossings, &poly);
+        if (ret == -2) { (*n_unknown)++; continue; }
+        if (ret < 0) { (*n_invalid)++; continue; }
+        poly_normalize(&poly, &norm);
+        int same = 1;
+        for (int e = -MAX_EXP; e <= MAX_EXP && same; e++) {
+            int c = (e >= norm.lo && e <= norm.hi) ? norm.c[e + OFFSET] : 0;
+            if (c != nominal_norm[e + OFFSET]) same = 0;
+        }
+        if (same) (*n_agree)++;
+    }
+    return 0;
+}
+
 /* ---- ctypes entry points ---- */
 
 /* Returns crossings (>=0) or a negative code (-1 no generic projection,

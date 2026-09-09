@@ -41,8 +41,10 @@ LINK_PROJECTION_SEED = 0
 LINK_PROJECTION_PHASE = 4.002148315014479
 # Localization-noise perturbation of link calls (see link_perturbation in C).
 LINK_PERTURB_DRAWS = 200
-LINK_PERTURB_XY_NM = 20.0
-LINK_PERTURB_Z_NM = 80.0
+THETA_PERTURB_DRAWS = 50
+PERTURB_XY_NM = 20.0
+PERTURB_Z_NM = 80.0
+MIN_PERTURBATION_AGREEMENT = 0.95
 DEFAULT_MAX_CROSSINGS = 16
 DEFAULT_CHUNK_ROWS = 100_000
 
@@ -53,6 +55,7 @@ THETA_SUMMARY_FIELDS = (
     "FailureReason", "NumDoubledLoci", "AssignmentCost",
     "AssignmentMargin", "YamadaPolynomial", "YamadaNormalized",
     "ProjectionStable", "PerturbationStable", "ForkModelStable",
+    "PerturbationAgreement", "PerturbationUnknown",
 )
 THETA_POINT_FIELDS = (
     "Dataset", "Location", "WalkID", "GraphID", "StrandID",
@@ -65,6 +68,7 @@ LINK_SUMMARY_FIELDS = (
     "FailureReason", "NumLoci", "AssignmentCost", "AssignmentMargin",
     "LinkingNumber", "MinInterLoopDistanceNm", "AssignmentStable",
     "PerturbationStable", "DisjointStable", "PerturbationAgreement",
+    "PerturbationUnknown",
 )
 LINK_POINT_FIELDS = (
     "Dataset", "Location", "WalkID", "LinkID", "LoopID",
@@ -172,8 +176,12 @@ class Engine:
         lib.link_perturbation.argtypes = [
             D, c_int, D, c_int, c_int, c_double, c_double, c_int, c_double, c_double,
             ctypes.c_ulonglong, c_int, I, I]
+        lib.theta_perturbation.argtypes = [
+            D, c_int, D, D, c_int, c_int, c_double, c_int, ctypes.c_ulonglong, c_int,
+            c_int, c_double, c_double, I, I, I, I]
         for name in ("compute_yamada", "validate_theta_strands", "assign_sisters",
-                     "theta_pattern", "compute_linking", "link_perturbation", "get_poly_size",
+                     "theta_pattern", "compute_linking", "link_perturbation",
+                     "theta_perturbation", "get_poly_size",
                      "get_offset", "get_link_nongeneric_sentinel", "get_max_loci",
                      "has_openmp", "get_memo_budget_mb"):
             getattr(lib, name).restype = c_int
@@ -323,6 +331,24 @@ class Engine:
         if rc:
             raise TopologyValidationError("loops exceed engine size limits")
         return agree.value, invalid.value
+
+    def theta_perturbation(self, singles, sister_a, sister_b, *, boundary_midpoint,
+                           tries, seed, max_crossings, draws, sigma_xy, sigma_z,
+                           nominal_terms):
+        """Count noise draws reproducing ``nominal_terms``; also invalid/unknown."""
+        nominal = (ctypes.c_int * self.poly_size)()
+        for exponent, coefficient in nominal_terms:
+            nominal[exponent + self.offset] = coefficient
+        agree, invalid, unknown = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        rc = self.lib.theta_perturbation(
+            self._flat(singles), len(singles), self._flat(sister_a), self._flat(sister_b),
+            len(sister_a), int(boundary_midpoint), GEOMETRY_TOL_NM, int(tries),
+            int(seed) & 0xFFFFFFFFFFFFFFFF, int(max_crossings), int(draws),
+            float(sigma_xy), float(sigma_z), nominal,
+            ctypes.byref(agree), ctypes.byref(invalid), ctypes.byref(unknown))
+        if rc:
+            raise TopologyValidationError("theta graph exceeds engine size limits")
+        return agree.value, invalid.value, unknown.value
 
 
 def _format_laurent(terms, variable="A"):
@@ -1007,7 +1033,8 @@ def _failure_summary(key, identifier, *, theta, count, status, reason):
             "AssignmentCost": "", "AssignmentMargin": "",
             "YamadaPolynomial": "", "YamadaNormalized": "",
             "ProjectionStable": "", "PerturbationStable": "",
-            "ForkModelStable": "",
+            "ForkModelStable": "", "PerturbationAgreement": "",
+            "PerturbationUnknown": "",
         }
     return {
         "Dataset": key[0], "Location": key[1], "WalkID": key[2],
@@ -1016,6 +1043,7 @@ def _failure_summary(key, identifier, *, theta, count, status, reason):
         "LinkingNumber": "", "MinInterLoopDistanceNm": "",
         "AssignmentStable": "", "PerturbationStable": "",
         "DisjointStable": "", "PerturbationAgreement": "",
+        "PerturbationUnknown": "",
     }
 
 
@@ -1026,6 +1054,10 @@ def _evaluate_theta(engine, strands, *, seeds, tries, max_crossings):
     reference = results[0].normalized_terms
     stable = all(result.normalized_terms == reference for result in results[1:])
     return results, stable
+
+
+def _seed_for(identifier):
+    return int(hashlib.sha256(identifier.encode("utf-8")).hexdigest()[:16], 16)
 
 
 def _log(message):
@@ -1042,8 +1074,8 @@ def detect(
     max_crossings=DEFAULT_MAX_CROSSINGS, link_projections=96,
     evidence_mode="calibrated-v3", evaluate_yamada_polynomial=True,
     chunk_rows=DEFAULT_CHUNK_ROWS, engine_path=ENGINE_SO, threads=None,
-    perturb_draws=LINK_PERTURB_DRAWS, perturb_xy_nm=LINK_PERTURB_XY_NM,
-    perturb_z_nm=LINK_PERTURB_Z_NM,
+    perturb_draws=LINK_PERTURB_DRAWS, theta_perturb_draws=THETA_PERTURB_DRAWS,
+    perturb_xy_nm=PERTURB_XY_NM, perturb_z_nm=PERTURB_Z_NM,
 ):
     started = time.time()
     config = load_config(config_path)
@@ -1163,6 +1195,7 @@ def detect(
                 engine.validate_theta(alternate)
                 raw_polynomial = normalized_polynomial = ""
                 projection_stable = fork_stable = ""
+                perturbation_stable = agreement = unknown_fraction = ""
                 if not evaluate_yamada_polynomial:
                     status = ("nominal_theta_geometry" if not reasons
                               else "theta_geometry_unstable")
@@ -1175,9 +1208,9 @@ def detect(
                             engine, alternate, seeds=yamada_seeds, tries=yamada_tries,
                             max_crossings=max_crossings)
                     except CrossingsExceeded as exc:
-                        crossings_seen["exceeded"] += 1
+                        crossings_seen["unknown"] += 1
                         reasons.append(str(exc))
-                        status = "theta_crossings_exceeded"
+                        status = "theta_unknown"
                     else:
                         crossings_seen[primary_results[0].crossings] += 1
                         fork_stable = int(
@@ -1191,6 +1224,18 @@ def detect(
                         if any(result.vertices != 2
                                for result in primary_results + alternate_results):
                             reasons.append("Yamada reconstruction has extra graph vertices")
+                        agree, _invalid, unknown = engine.theta_perturbation(
+                            singles, assignment.sister_a, assignment.sister_b,
+                            boundary_midpoint=True, tries=yamada_tries,
+                            seed=_seed_for(identifier), max_crossings=max_crossings,
+                            draws=theta_perturb_draws, sigma_xy=perturb_xy_nm,
+                            sigma_z=perturb_z_nm,
+                            nominal_terms=primary_results[0].normalized_terms)
+                        agreement = agree / theta_perturb_draws
+                        unknown_fraction = unknown / theta_perturb_draws
+                        perturbation_stable = int(agreement >= MIN_PERTURBATION_AGREEMENT)
+                        if not perturbation_stable:
+                            reasons.append("Yamada polynomial changes under localization noise")
                         status = "nominal_theta_graph" if not reasons else "theta_unstable"
                         raw_polynomial = _format_laurent(primary_results[0].raw_terms)
                         normalized_polynomial = _format_laurent(
@@ -1206,7 +1251,10 @@ def detect(
                     "YamadaPolynomial": raw_polynomial,
                     "YamadaNormalized": normalized_polynomial,
                     "ProjectionStable": projection_stable,
-                    "PerturbationStable": "", "ForkModelStable": fork_stable,
+                    "PerturbationStable": perturbation_stable,
+                    "ForkModelStable": fork_stable,
+                    "PerturbationAgreement": agreement,
+                    "PerturbationUnknown": unknown_fraction,
                 })
                 theta_points.extend(_theta_points(
                     key, identifier, config, pattern, assignment, singles,
@@ -1222,14 +1270,13 @@ def detect(
                     n_projections=link_projections)
                 if not evaluation.stable:
                     reasons.append("linking number changes across projections")
-                seed = int(hashlib.sha256(identifier.encode("utf-8")).hexdigest()[:16], 16)
-                agree, _invalid = engine.link_perturbation(
+                agree, invalid = engine.link_perturbation(
                     assignment.sister_a, assignment.sister_b,
                     n_projections=link_projections, draws=perturb_draws,
-                    sigma_xy=perturb_xy_nm, sigma_z=perturb_z_nm, seed=seed,
-                    nominal=evaluation.linking_number)
+                    sigma_xy=perturb_xy_nm, sigma_z=perturb_z_nm,
+                    seed=_seed_for(identifier), nominal=evaluation.linking_number)
                 agreement = agree / perturb_draws
-                perturbation_stable = int(agreement >= LINK_MIN_PROJECTION_STABILITY)
+                perturbation_stable = int(agreement >= MIN_PERTURBATION_AGREEMENT)
                 if not perturbation_stable:
                     reasons.append("linking number changes under localization noise")
                 if reasons:
@@ -1250,6 +1297,7 @@ def detect(
                     "AssignmentStable": int(assignment_stable),
                     "PerturbationStable": perturbation_stable, "DisjointStable": "",
                     "PerturbationAgreement": agreement,
+                    "PerturbationUnknown": invalid / perturb_draws,
                 })
                 link_points.extend(_link_points(
                     key, identifier, config, assignment, component_pairs))
@@ -1311,11 +1359,12 @@ def detect(
         "link_projection_seed": LINK_PROJECTION_SEED,
         "link_min_valid_projections": LINK_MIN_VALID_PROJECTIONS,
         "link_min_projection_stability": LINK_MIN_PROJECTION_STABILITY,
-        "link_perturbation": {
-            "draws": perturb_draws, "sigma_xy_nm": perturb_xy_nm,
-            "sigma_z_nm": perturb_z_nm,
-            "min_agreement": LINK_MIN_PROJECTION_STABILITY,
-            "noise_model": "independent Gaussian per loop vertex; theta strands not perturbed",
+        "perturbation": {
+            "link_draws": perturb_draws, "theta_draws": theta_perturb_draws,
+            "sigma_xy_nm": perturb_xy_nm, "sigma_z_nm": perturb_z_nm,
+            "min_agreement": MIN_PERTURBATION_AGREEMENT,
+            "noise_model": ("independent Gaussian per observed locus; theta forks "
+                            "recomputed from perturbed neighbours (boundary-midpoint model)"),
         },
         "geometry_intersection_tolerance_nm": GEOMETRY_TOL_NM,
         "csv_chunk_rows": chunk_rows,
@@ -1466,16 +1515,19 @@ def build_parser():
     parser.add_argument("--yamada-tries", type=int, default=60)
     parser.add_argument(
         "--max-crossings", type=int, default=DEFAULT_MAX_CROSSINGS,
-        help=("report theta_crossings_exceeded instead of evaluating a theta whose "
+        help=("report theta_unknown instead of evaluating a theta whose "
               "best projection has more crossings (skein states grow as 3^c)"))
     parser.add_argument("--link-projections", type=int, default=96)
     parser.add_argument(
         "--perturb-draws", type=int, default=LINK_PERTURB_DRAWS,
         help="noise re-draws of both sister loops per link call (PerturbationStable)")
-    parser.add_argument("--perturb-xy-nm", type=float, default=LINK_PERTURB_XY_NM,
-                        help="Gaussian sigma added to loop X and Y (nm) per draw")
-    parser.add_argument("--perturb-z-nm", type=float, default=LINK_PERTURB_Z_NM,
-                        help="Gaussian sigma added to loop Z (nm) per draw")
+    parser.add_argument(
+        "--theta-perturb-draws", type=int, default=THETA_PERTURB_DRAWS,
+        help="noise re-draws of all observed loci per evaluated theta (one polynomial each)")
+    parser.add_argument("--perturb-xy-nm", type=float, default=PERTURB_XY_NM,
+                        help="Gaussian sigma added to X and Y (nm) per draw")
+    parser.add_argument("--perturb-z-nm", type=float, default=PERTURB_Z_NM,
+                        help="Gaussian sigma added to Z (nm) per draw")
     parser.add_argument(
         "--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS,
         help="CSV rows resident per chunk; smaller files load as one chunk")
@@ -1489,8 +1541,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if (args.yamada_tries < 1 or args.link_projections < LINK_MIN_VALID_PROJECTIONS
             or args.max_crossings < 1 or args.chunk_rows < 1 or args.perturb_draws < 1
-            or args.perturb_xy_nm < 0 or args.perturb_z_nm < 0):
-        print("error: --yamada-tries, --max-crossings, --chunk-rows and --perturb-draws "
+            or args.theta_perturb_draws < 1 or args.perturb_xy_nm < 0 or args.perturb_z_nm < 0):
+        print("error: --yamada-tries, --max-crossings, --chunk-rows and --*perturb-draws "
               f"must be positive, --perturb-*-nm non-negative and --link-projections >= "
               f"{LINK_MIN_VALID_PROJECTIONS}", file=sys.stderr)
         return 2
@@ -1507,8 +1559,8 @@ def main(argv=None):
             evidence_mode=args.evidence_mode,
             evaluate_yamada_polynomial=not args.skip_yamada,
             chunk_rows=args.chunk_rows, threads=threads,
-            perturb_draws=args.perturb_draws, perturb_xy_nm=args.perturb_xy_nm,
-            perturb_z_nm=args.perturb_z_nm)
+            perturb_draws=args.perturb_draws, theta_perturb_draws=args.theta_perturb_draws,
+            perturb_xy_nm=args.perturb_xy_nm, perturb_z_nm=args.perturb_z_nm)
     except (TopologyDetectionError, TopologyValidationError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

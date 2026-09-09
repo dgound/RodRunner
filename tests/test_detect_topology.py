@@ -192,8 +192,10 @@ class DetectTopologyTest(unittest.TestCase):
         self.assertEqual(manifest["provenance"]["theta_candidates"], 1)
         self.assertEqual(manifest["provenance"]["link_candidates"], 1)
         with paths["theta_summary"].open(newline="") as handle:
-            self.assertEqual(next(csv.DictReader(handle))["ThetaStatus"],
-                             "nominal_theta_graph")
+            theta = next(csv.DictReader(handle))
+            self.assertEqual(theta["ThetaStatus"], "nominal_theta_graph")
+            self.assertEqual(theta["PerturbationStable"], "1")
+            self.assertGreaterEqual(float(theta["PerturbationAgreement"]), 0.95)
         with paths["link_summary"].open(newline="") as handle:
             link = next(csv.DictReader(handle))
             self.assertEqual(link["LinkStatus"], "nominal_linked_polygon")

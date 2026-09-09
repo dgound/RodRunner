@@ -200,6 +200,25 @@ class ThetaYamadaTest(EngineTest):
         with self.assertRaises(CrossingsExceeded):
             self.engine.yamada([s1, s2, s3], tries=60, seed=42, max_crossings=1)
 
+    def test_perturbation_agreement_for_planar_theta(self):
+        # Observed loci (no forks): single-copy arc and two well-separated sisters.
+        singles = [(1000.0 * math.cos(a), 1000.0 * math.sin(a), 0.0)
+                   for a in [math.pi * i / 10 for i in range(1, 10)]]
+        sister_a = [(1000.0 * math.cos(a), -1000.0 * math.sin(a), 0.0)
+                    for a in [math.pi * i / 10 for i in range(1, 10)]]
+        sister_b = [(600.0 * math.cos(a), -600.0 * math.sin(a), 0.0)
+                    for a in [math.pi * i / 10 for i in range(1, 10)]]
+        nominal = ((4, -1), (3, -1), (2, -2), (1, -1), (0, -1))
+        agree, invalid, unknown = self.engine.theta_perturbation(
+            singles, sister_a, sister_b, boundary_midpoint=True, tries=20, seed=3,
+            max_crossings=16, draws=40, sigma_xy=20.0, sigma_z=80.0, nominal_terms=nominal)
+        self.assertEqual((agree, invalid, unknown), (40, 0, 0))
+        agree, invalid, unknown = self.engine.theta_perturbation(
+            singles, sister_a, sister_b, boundary_midpoint=True, tries=20, seed=3,
+            max_crossings=16, draws=40, sigma_xy=20.0, sigma_z=80.0,
+            nominal_terms=((0, 1),))
+        self.assertEqual(agree, 0)
+
     def test_theta_requires_exact_shared_endpoints(self):
         strands = planar_theta()
         x, y, z = strands[1][0]

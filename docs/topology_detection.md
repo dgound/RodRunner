@@ -66,8 +66,8 @@ python pipeline/detect_topology.py \
 
 `--max-crossings` (default 16) bounds the skein resolution: a theta whose best
 projection over all seeds needs more crossings is written with status
-`theta_crossings_exceeded` and blank polynomial fields, but its reconstructed
-strand points are still emitted. `--threads` sets the OpenMP thread count; under
+`theta_unknown` and blank polynomial fields, but its reconstructed strand
+points are still emitted. `--threads` sets the OpenMP thread count; under
 SLURM it defaults to `SLURM_CPUS_PER_TASK`.
 
 For exploratory work on an existing unfiltered trace-salvage full-schema CSV,
@@ -142,8 +142,13 @@ nanometres of each other is flagged this way rather than reported as a link.
 
 The current v3 fitter does not provide two-component-center standard errors.
 One-spot errors are retained when present, but sister/fork errors remain
-blank and theta `PerturbationStable` is not evaluated. Zero uncertainty is
-never fabricated. For
+blank. Instead, every evaluated theta is re-drawn `--theta-perturb-draws`
+times (default 50) with the same localization noise as links, the two fork
+midpoints recomputed from the perturbed loci, and the normalized polynomial
+recomputed: `PerturbationAgreement` is the fraction of draws reproducing the
+nominal polynomial and `PerturbationUnknown` the fraction that exceeded the
+crossing cap. Agreement below 0.95 makes the theta `theta_unstable`. Zero
+uncertainty is never fabricated. For
 that reason the positive status is explicitly `nominal_theta_graph` or
 `nominal_linked_polygon`: it describes the fitted straight-segment geometry,
 not topology proven stable under localization uncertainty or every admissible
@@ -155,7 +160,7 @@ Exactly five files are written:
 
 - `theta_graph_summary.csv`: one row per theta-pattern candidate and its
   nominal-geometry or failure status, plus raw and normalized Yamada
-  polynomials.
+  polynomials and the perturbation agreement.
 - `theta_strand_points.csv`: long-form XYZ-nm points for `unreplicated`,
   `sister_A`, and `sister_B`. All three paths share the same two explicit fork
   vertices.
