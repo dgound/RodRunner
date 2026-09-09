@@ -131,11 +131,19 @@ primary double. Global circular sister assignment produces two polygonal 3D
 loops. The link stage requires each loop to be simple and the two loops to be
 disjoint, then computes the oriented linking number across deterministic
 projections. Linking number zero is reported as `nominal_unlinked_polygon`,
-not as a detected link.
+not as a detected link. Each link call is then re-evaluated under
+localization noise: both sister loops are re-drawn `--perturb-draws` times
+(default 200) with independent Gaussian noise of `--perturb-xy-nm` (default
+20) on X and Y and `--perturb-z-nm` (default 80) on Z, and the fraction of
+draws reproducing the nominal linking number is written to
+`PerturbationAgreement`. Below 0.95 the call is `link_unstable` with
+`PerturbationStable=0`; a linked polygon whose loops pass within tens of
+nanometres of each other is flagged this way rather than reported as a link.
 
 The current v3 fitter does not provide two-component-center standard errors.
-One-spot errors are retained when present, but sister/fork errors and
-`PerturbationStable` remain blank. Zero uncertainty is never fabricated. For
+One-spot errors are retained when present, but sister/fork errors remain
+blank and theta `PerturbationStable` is not evaluated. Zero uncertainty is
+never fabricated. For
 that reason the positive status is explicitly `nominal_theta_graph` or
 `nominal_linked_polygon`: it describes the fitted straight-segment geometry,
 not topology proven stable under localization uncertainty or every admissible
@@ -152,7 +160,7 @@ Exactly five files are written:
   `sister_A`, and `sister_B`. All three paths share the same two explicit fork
   vertices.
 - `link_summary.csv`: one row per fully doubled candidate, including linking
-  number and minimum inter-loop distance.
+  number, minimum inter-loop distance, and the perturbation agreement.
 - `link_loop_points.csv`: long-form XYZ-nm vertices for both sister loops.
   Closure is declared by `Closed=1`; the first vertex is not duplicated.
 - `topology_manifest.json`: input hashes, coordinate transform, policies, row

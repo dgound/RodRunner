@@ -259,6 +259,23 @@ class LinkTest(EngineTest):
         with self.assertRaisesRegex(TopologyValidationError, "disjoint"):
             self.engine.linking(first, list(first), n_projections=96)
 
+    def test_perturbation_separates_robust_and_fragile_calls(self):
+        first, second = hopf_loops()
+        agree, invalid = self.engine.link_perturbation(
+            first, second, n_projections=96, draws=100, sigma_xy=20.0, sigma_z=80.0,
+            seed=7, nominal=self.engine.linking(first, second, n_projections=96).linking_number)
+        self.assertEqual((agree, invalid), (100, 0))
+        # Second loop shifted so it pierces the first loop's plane 10 nm outside
+        # the first loop's curve: nominally unlinked, but within localization noise.
+        grazing = [(x + 2010.0, y, z) for x, y, z in
+                   [(1000.0 * math.cos(a), 0.0, 1000.0 * math.sin(a))
+                    for a in [2.0 * math.pi * i / 48 for i in range(48)]]]
+        nominal = self.engine.linking(first, grazing, n_projections=96).linking_number
+        agree, invalid = self.engine.link_perturbation(
+            first, grazing, n_projections=96, draws=100, sigma_xy=20.0, sigma_z=80.0,
+            seed=7, nominal=nominal)
+        self.assertLess(agree, 95)
+
     def test_self_intersecting_loop_is_rejected(self):
         bow_tie = [(-1.0, -1.0, 0.0), (1.0, 1.0, 0.0), (-1.0, 1.0, 0.0), (1.0, -1.0, 0.0)]
         _, second = hopf_loops(n=16)

@@ -1126,6 +1126,57 @@ int compute_linking(const double *loop_a, int na, const double *loop_b, int nb,
     return 0;
 }
 
+/* ========================================================================
+ * 11. Perturbation stability of the linking number.
+ *     Both loops are re-drawn `draws` times with independent Gaussian noise
+ *     (sigma_xy on x and y, sigma_z on z, xorshift64* + Box-Muller, seeded)
+ *     and the modal linking number of each draw is compared to `nominal`.
+ *     Draws whose perturbed loops fail validation or have no generic
+ *     projection are counted in *n_invalid and do not count as agreement.
+ * ======================================================================== */
+
+static inline double unit_uniform(unsigned long long *s) {
+    *s ^= *s >> 12; *s ^= *s << 25; *s ^= *s >> 27;
+    unsigned long long x = *s * 0x2545F4914F6CDD1DULL;
+    return ((double)(x >> 11) + 0.5) / (double)(1ULL << 53);
+}
+
+static inline double gaussian(unsigned long long *s) {
+    double u1 = unit_uniform(s), u2 = unit_uniform(s);
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+}
+
+int link_perturbation(const double *loop_a, int na, const double *loop_b, int nb,
+                      int n_projections, double phase, double tol,
+                      int draws, double sigma_xy, double sigma_z,
+                      unsigned long long seed, int nominal,
+                      int *n_agree, int *n_invalid) {
+    if (na > MAX_POINTS || nb > MAX_POINTS || na < 1 || nb < 1) return -30;
+    if (draws < 1 || n_projections < 1) return -31;
+    double A[MAX_POINTS*3], B[MAX_POINTS*3];
+    int values[n_projections];
+    unsigned long long rng = seed ? seed : 0x9E3779B97F4A7C15ULL;
+    *n_agree = 0; *n_invalid = 0;
+    for (int d = 0; d < draws; d++) {
+        for (int i = 0; i < na; i++) {
+            A[i*3]   = loop_a[i*3]   + sigma_xy * gaussian(&rng);
+            A[i*3+1] = loop_a[i*3+1] + sigma_xy * gaussian(&rng);
+            A[i*3+2] = loop_a[i*3+2] + sigma_z  * gaussian(&rng);
+        }
+        for (int i = 0; i < nb; i++) {
+            B[i*3]   = loop_b[i*3]   + sigma_xy * gaussian(&rng);
+            B[i*3+1] = loop_b[i*3+1] + sigma_xy * gaussian(&rng);
+            B[i*3+2] = loop_b[i*3+2] + sigma_z  * gaussian(&rng);
+        }
+        int ln, nv, modal; double dist;
+        int rc = compute_linking(A, na, B, nb, n_projections, phase, tol,
+                                 values, &ln, &nv, &modal, &dist);
+        if (rc != 0) { (*n_invalid)++; continue; }
+        if (ln == nominal) (*n_agree)++;
+    }
+    return 0;
+}
+
 /* ---- ctypes entry points ---- */
 
 /* Returns crossings (>=0) or a negative code (-1 no generic projection,

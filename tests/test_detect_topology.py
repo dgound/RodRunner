@@ -168,7 +168,7 @@ class DetectTopologyTest(unittest.TestCase):
             config_path=self.config, reduction_manifest=self.reduction_manifest,
             output_dir=self.root / "out",
             yamada_seeds=(0, 1), yamada_tries=20,
-            link_projections=32)
+            link_projections=32, perturb_xy_nm=1.0, perturb_z_nm=1.0)
         _, theta_points = self._read(paths["theta_points"])
         strands = {}
         for row in theta_points:
@@ -198,6 +198,8 @@ class DetectTopologyTest(unittest.TestCase):
             link = next(csv.DictReader(handle))
             self.assertEqual(link["LinkStatus"], "nominal_linked_polygon")
             self.assertEqual(abs(int(link["LinkingNumber"])), 1)
+            self.assertEqual(link["PerturbationStable"], "1")
+            self.assertGreaterEqual(float(link["PerturbationAgreement"]), 0.95)
 
     def test_legacy_full_schema_mode_is_explicit_and_reconstructs_geometry(self):
         loci, coordinates = self._inputs()
@@ -252,7 +254,8 @@ class DetectTopologyTest(unittest.TestCase):
             config_path=self.config, reduction_manifest=None,
             output_dir=self.root / "legacy-out",
             evidence_mode="legacy-full-schema",
-            evaluate_yamada_polynomial=False, link_projections=16)
+            evaluate_yamada_polynomial=False, link_projections=16,
+            perturb_xy_nm=1.0, perturb_z_nm=1.0)
         manifest = json.loads(paths["manifest"].read_text())["provenance"]
         self.assertFalse(manifest["publication_calibrated"])
         self.assertFalse(manifest["ownership_required"])

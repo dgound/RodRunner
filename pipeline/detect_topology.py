@@ -39,6 +39,10 @@ LINK_PROJECTION_SEED = 0
 # numpy.random.default_rng(0).uniform(0, 2*pi): keeps the projection sweep
 # identical to earlier runs without importing numpy.
 LINK_PROJECTION_PHASE = 4.002148315014479
+# Localization-noise perturbation of link calls (see link_perturbation in C).
+LINK_PERTURB_DRAWS = 200
+LINK_PERTURB_XY_NM = 20.0
+LINK_PERTURB_Z_NM = 80.0
 DEFAULT_MAX_CROSSINGS = 16
 DEFAULT_CHUNK_ROWS = 100_000
 
@@ -60,7 +64,7 @@ LINK_SUMMARY_FIELDS = (
     "Dataset", "Location", "WalkID", "LinkID", "LinkStatus",
     "FailureReason", "NumLoci", "AssignmentCost", "AssignmentMargin",
     "LinkingNumber", "MinInterLoopDistanceNm", "AssignmentStable",
-    "PerturbationStable", "DisjointStable",
+    "PerturbationStable", "DisjointStable", "PerturbationAgreement",
 )
 LINK_POINT_FIELDS = (
     "Dataset", "Location", "WalkID", "LinkID", "LoopID",
@@ -165,8 +169,11 @@ class Engine:
         lib.theta_pattern.argtypes = [c_int, c_int, c_int, c_uint, c_uint] + [I] * 8
         lib.compute_linking.argtypes = [
             D, c_int, D, c_int, c_int, c_double, c_double, I, I, I, I, D]
+        lib.link_perturbation.argtypes = [
+            D, c_int, D, c_int, c_int, c_double, c_double, c_int, c_double, c_double,
+            ctypes.c_ulonglong, c_int, I, I]
         for name in ("compute_yamada", "validate_theta_strands", "assign_sisters",
-                     "theta_pattern", "compute_linking", "get_poly_size",
+                     "theta_pattern", "compute_linking", "link_perturbation", "get_poly_size",
                      "get_offset", "get_link_nongeneric_sentinel", "get_max_loci",
                      "has_openmp", "get_memo_budget_mb"):
             getattr(lib, name).restype = c_int
@@ -302,6 +309,20 @@ class Engine:
         stable = (valid.value >= LINK_MIN_VALID_PROJECTIONS and
                   stability >= LINK_MIN_PROJECTION_STABILITY)
         return Linking(number.value, valid.value, stability, stable, distance.value)
+
+    def link_perturbation(self, loop_a, loop_b, *, n_projections, draws, sigma_xy,
+                          sigma_z, seed, nominal):
+        """Count noise draws whose linking number equals ``nominal``."""
+        a, b = self._flat(loop_a), self._flat(loop_b)
+        agree, invalid = ctypes.c_int(), ctypes.c_int()
+        rc = self.lib.link_perturbation(
+            a, len(loop_a), b, len(loop_b), int(n_projections), LINK_PROJECTION_PHASE,
+            GEOMETRY_TOL_NM, int(draws), float(sigma_xy), float(sigma_z),
+            int(seed) & 0xFFFFFFFFFFFFFFFF, int(nominal),
+            ctypes.byref(agree), ctypes.byref(invalid))
+        if rc:
+            raise TopologyValidationError("loops exceed engine size limits")
+        return agree.value, invalid.value
 
 
 def _format_laurent(terms, variable="A"):
@@ -994,7 +1015,7 @@ def _failure_summary(key, identifier, *, theta, count, status, reason):
         "NumLoci": count, "AssignmentCost": "", "AssignmentMargin": "",
         "LinkingNumber": "", "MinInterLoopDistanceNm": "",
         "AssignmentStable": "", "PerturbationStable": "",
-        "DisjointStable": "",
+        "DisjointStable": "", "PerturbationAgreement": "",
     }
 
 
@@ -1021,6 +1042,8 @@ def detect(
     max_crossings=DEFAULT_MAX_CROSSINGS, link_projections=96,
     evidence_mode="calibrated-v3", evaluate_yamada_polynomial=True,
     chunk_rows=DEFAULT_CHUNK_ROWS, engine_path=ENGINE_SO, threads=None,
+    perturb_draws=LINK_PERTURB_DRAWS, perturb_xy_nm=LINK_PERTURB_XY_NM,
+    perturb_z_nm=LINK_PERTURB_Z_NM,
 ):
     started = time.time()
     config = load_config(config_path)
@@ -1199,6 +1222,16 @@ def detect(
                     n_projections=link_projections)
                 if not evaluation.stable:
                     reasons.append("linking number changes across projections")
+                seed = int(hashlib.sha256(identifier.encode("utf-8")).hexdigest()[:16], 16)
+                agree, _invalid = engine.link_perturbation(
+                    assignment.sister_a, assignment.sister_b,
+                    n_projections=link_projections, draws=perturb_draws,
+                    sigma_xy=perturb_xy_nm, sigma_z=perturb_z_nm, seed=seed,
+                    nominal=evaluation.linking_number)
+                agreement = agree / perturb_draws
+                perturbation_stable = int(agreement >= LINK_MIN_PROJECTION_STABILITY)
+                if not perturbation_stable:
+                    reasons.append("linking number changes under localization noise")
                 if reasons:
                     status = "link_unstable"
                 elif evaluation.linking_number:
@@ -1215,7 +1248,8 @@ def detect(
                     "LinkingNumber": evaluation.linking_number,
                     "MinInterLoopDistanceNm": evaluation.min_distance_nm,
                     "AssignmentStable": int(assignment_stable),
-                    "PerturbationStable": "", "DisjointStable": "",
+                    "PerturbationStable": perturbation_stable, "DisjointStable": "",
+                    "PerturbationAgreement": agreement,
                 })
                 link_points.extend(_link_points(
                     key, identifier, config, assignment, component_pairs))
@@ -1277,6 +1311,12 @@ def detect(
         "link_projection_seed": LINK_PROJECTION_SEED,
         "link_min_valid_projections": LINK_MIN_VALID_PROJECTIONS,
         "link_min_projection_stability": LINK_MIN_PROJECTION_STABILITY,
+        "link_perturbation": {
+            "draws": perturb_draws, "sigma_xy_nm": perturb_xy_nm,
+            "sigma_z_nm": perturb_z_nm,
+            "min_agreement": LINK_MIN_PROJECTION_STABILITY,
+            "noise_model": "independent Gaussian per loop vertex; theta strands not perturbed",
+        },
         "geometry_intersection_tolerance_nm": GEOMETRY_TOL_NM,
         "csv_chunk_rows": chunk_rows,
     }
@@ -1430,6 +1470,13 @@ def build_parser():
               "best projection has more crossings (skein states grow as 3^c)"))
     parser.add_argument("--link-projections", type=int, default=96)
     parser.add_argument(
+        "--perturb-draws", type=int, default=LINK_PERTURB_DRAWS,
+        help="noise re-draws of both sister loops per link call (PerturbationStable)")
+    parser.add_argument("--perturb-xy-nm", type=float, default=LINK_PERTURB_XY_NM,
+                        help="Gaussian sigma added to loop X and Y (nm) per draw")
+    parser.add_argument("--perturb-z-nm", type=float, default=LINK_PERTURB_Z_NM,
+                        help="Gaussian sigma added to loop Z (nm) per draw")
+    parser.add_argument(
         "--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS,
         help="CSV rows resident per chunk; smaller files load as one chunk")
     parser.add_argument(
@@ -1441,10 +1488,11 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if (args.yamada_tries < 1 or args.link_projections < LINK_MIN_VALID_PROJECTIONS
-            or args.max_crossings < 1 or args.chunk_rows < 1):
-        print("error: --yamada-tries, --max-crossings and --chunk-rows must be "
-              f"positive and --link-projections >= {LINK_MIN_VALID_PROJECTIONS}",
-              file=sys.stderr)
+            or args.max_crossings < 1 or args.chunk_rows < 1 or args.perturb_draws < 1
+            or args.perturb_xy_nm < 0 or args.perturb_z_nm < 0):
+        print("error: --yamada-tries, --max-crossings, --chunk-rows and --perturb-draws "
+              f"must be positive, --perturb-*-nm non-negative and --link-projections >= "
+              f"{LINK_MIN_VALID_PROJECTIONS}", file=sys.stderr)
         return 2
     threads = args.threads
     if threads is None and os.environ.get("SLURM_CPUS_PER_TASK", "").isdigit():
@@ -1458,7 +1506,9 @@ def main(argv=None):
             max_crossings=args.max_crossings, link_projections=args.link_projections,
             evidence_mode=args.evidence_mode,
             evaluate_yamada_polynomial=not args.skip_yamada,
-            chunk_rows=args.chunk_rows, threads=threads)
+            chunk_rows=args.chunk_rows, threads=threads,
+            perturb_draws=args.perturb_draws, perturb_xy_nm=args.perturb_xy_nm,
+            perturb_z_nm=args.perturb_z_nm)
     except (TopologyDetectionError, TopologyValidationError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
