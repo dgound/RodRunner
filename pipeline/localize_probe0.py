@@ -31,6 +31,20 @@ if not os.path.exists(c_lib) or os.path.getmtime(c_src) > os.path.getmtime(c_lib
 
 lib = ctypes.CDLL(c_lib)
 
+# Same on-demand build for the preprocessing library.
+_pp_src = os.path.join(_HERE, 'preprocess3d.c')
+_preprocess_lib_path = os.path.join(_HERE, 'preprocess3d.so')
+if os.path.exists(_pp_src) and (not os.path.exists(_preprocess_lib_path)
+                                or os.path.getmtime(_pp_src) > os.path.getmtime(_preprocess_lib_path)):
+    print('Compiling C preprocessing library (trying OpenMP)...')
+    if os.system(f'gcc -O3 -fopenmp -shared -fPIC -o {_preprocess_lib_path} {_pp_src} -lm') == 0:
+        print('  Compiled with OpenMP.')
+    elif os.system(f'gcc -O3 -shared -fPIC -o {_preprocess_lib_path} {_pp_src} -lm') == 0:
+        print('  Compiled without OpenMP (serial).')
+    else:
+        print(f'  WARNING: failed to compile {_preprocess_lib_path} from {_pp_src}; '
+              'preprocessing will be disabled.')
+
 # Optional axial-PSF cap. --sigma_z_max V (voxels) clamps the fitted sigma_z to
 # [0.2, V] instead of the loose [0.2, nz], removing the thin-stack sigma_z
 # blow-up and the degeneracy-driven "confidently wrong" z it produces. Default
@@ -153,7 +167,6 @@ if lib.has_openmp():
     print(f'Fitter: OpenMP enabled, max threads = {lib.openmp_max_threads()}')
 else:
     print('Fitter: serial (no OpenMP in this .so)')
-_preprocess_lib_path = os.path.join(_HERE, 'preprocess3d.so')
 if _args.no_preprocess:
     _pp = None
     print('Preprocessing: disabled (--no-preprocess)')
