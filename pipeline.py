@@ -71,6 +71,15 @@ def parse_args(argv=None):
                       help='Axial sigma cap in voxels, 0 = uncapped (default: 0)')
     geom.add_argument('--min-sbr', type=float, default=0,
                       help='Minimum amplitude/background to accept a fit, 0 = off (default: 0)')
+    geom.add_argument('--preprocess-radius', type=int, default=20,
+                      help='Preprocessing background-removal disk radius in px (default 20)')
+    geom.add_argument('--preprocess-wavelet-levels', type=int, default=3,
+                      help='Preprocessing wavelet denoise levels, 0 disables (default 3)')
+    geom.add_argument('--preprocess-diffusion-iters', type=int, default=5,
+                      help='Preprocessing anisotropic-diffusion iterations, 0 disables (default 5)')
+    geom.add_argument('--preprocess-nlm', type=float, nargs=3, default=None,
+                      metavar=('SEARCH_R', 'PATCH_R', 'SIGMA'),
+                      help='Add non-local-means denoising to preprocessing (default off)')
     geom.add_argument('--no-preprocess', action='store_true',
                       help='Disable image preprocessing (denoise + morpho background removal) '
                            'before fitting. Preprocessing is on by default.')
@@ -181,7 +190,9 @@ def discover_locations(input_dir, location_glob, source):
             continue
         if source == 'dat' and (d / 'Raw Images').is_dir():
             locations.append(d.name)
-        elif source == 'tiff' and (d / 'output').is_dir():
+        elif source == 'tiff' and ((d / 'output').is_dir()
+                                   or (d / 'probe_0').is_dir()):
+            # same two layouts _setup_work_tree accepts
             locations.append(d.name)
     return locations
 
@@ -287,6 +298,9 @@ def process_location(loc, args, work, env):
     # --- 2. Clump split (stitched mode only) ---
     if seg in ('2p5d', '2p5d-zgated', '3d'):
         print(f'### 2. Clump-split disabled for {seg} ###')
+    elif args.skip_segmentation:
+        # reused masks_final.tif is already the post-split product
+        print('### 2. Clump-split skipped (masks reused) ###')
     elif seg == 'stitched':
         dapi = str(work / 'probe_2' / 'cellpose_masks' / 'averaged_dapi.tif')
         if os.path.isfile(dapi):
@@ -303,7 +317,11 @@ def process_location(loc, args, work, env):
         py, os.path.join(pd, 'localize_probe0.py'),
         '--sigma_z_max', str(args.sigma_z_max),
         '--min_sbr', str(args.min_sbr),
-    ] + (['--no-preprocess'] if args.no_preprocess else []) + [
+    ] + (['--no-preprocess'] if args.no_preprocess else [
+        '--preprocess-radius', str(args.preprocess_radius),
+        '--preprocess-wavelet-levels', str(args.preprocess_wavelet_levels),
+        '--preprocess-diffusion-iters', str(args.preprocess_diffusion_iters),
+    ] + (['--preprocess-nlm'] + [str(v) for v in args.preprocess_nlm] if args.preprocess_nlm else [])) + [
         '--segmentation-mode', seg,
         '--z-gate-failure-policy', 'quarantine',
         '--center-ownership', args.center_ownership,

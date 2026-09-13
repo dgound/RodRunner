@@ -648,18 +648,31 @@ def main():
     if args.trace_salvage:
         salvage_result = _run_trace_salvage(
             args, location_dirs, trace_settings)
-        full_schema_path = salvage_result.get('full_schema')
+        # run_dataset()/apply_policy() return the salvage manifest; output
+        # paths sit under manifest['outputs'][name]['path'] as basenames
+        # relative to the salvage outdir.
+        fs_entry = (salvage_result.get('outputs') or {}).get('full_schema')
+        fs_name = fs_entry.get('path') if isinstance(fs_entry, dict) else fs_entry
+        full_schema_path = (
+            Path(args.trace_salvage_outdir or args.outdir) / fs_name
+            if fs_name else None)
         if full_schema_path and os.path.isfile(str(full_schema_path)):
+            # The salvage file numbers walks over the attempt-ledger universe,
+            # so its global WalkID is NOT the merge's WalkID. Join on the
+            # location-local key: (Location, OriginalWalkID) == (Location, orig_ID).
             salvage_df = pd.read_csv(
                 str(full_schema_path),
-                usecols=['WalkID'] + _TRACE_WALK_COLUMNS,
+                usecols=['Location', 'OriginalWalkID'] + _TRACE_WALK_COLUMNS,
                 low_memory=False)
             salvage_walk = (salvage_df
-                            .groupby('WalkID')[_TRACE_WALK_COLUMNS]
+                            .groupby(['Location', 'OriginalWalkID'])[_TRACE_WALK_COLUMNS]
                             .first()
-                            .reset_index())
+                            .reset_index()
+                            .rename(columns={'OriginalWalkID': 'orig_ID'}))
+            salvage_walk['orig_ID'] = pd.to_numeric(salvage_walk['orig_ID'])
+            allw['orig_ID'] = pd.to_numeric(allw['orig_ID'])
             rows_before = len(allw)
-            allw = allw.merge(salvage_walk, on='WalkID',
+            allw = allw.merge(salvage_walk, on=['Location', 'orig_ID'],
                               how='left', validate='many_to_one')
             assert len(allw) == rows_before, (
                 f'salvage join changed row count {rows_before} -> {len(allw)}')

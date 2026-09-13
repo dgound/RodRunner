@@ -539,3 +539,21 @@ void preprocess_denoise_morpho(double *data, int nz, int ny, int nx, int morpho_
         morpho_bg_remove_2d(data + z * slice_size, ny, nx, morpho_radius);
     }
 }
+
+/* Configurable variant for modality tuning. A stage is skipped when its
+ * leading parameter is <= 0. Defaults equivalent to preprocess_denoise_morpho:
+ * wavelet_levels=3, diffusion_iters=5, diffusion_kappa=30, nlm_search_r=0. */
+void preprocess_custom(double *data, int nz, int ny, int nx, int morpho_radius,
+                       int wavelet_levels, int diffusion_iters, double diffusion_kappa,
+                       int nlm_search_r, int nlm_patch_r, double nlm_sigma) {
+    int slice_size = ny * nx;
+    for (int z = 0; z < nz; z++) {
+        double *slice = data + z * slice_size;
+        if (wavelet_levels > 0) wavelet_denoise_2d(slice, ny, nx, wavelet_levels);
+        if (diffusion_iters > 0) anisotropic_diffusion_2d(slice, ny, nx, diffusion_iters, diffusion_kappa, 0.14);
+        if (nlm_search_r > 0) nlm_denoise_2d(slice, ny, nx, nlm_search_r, nlm_patch_r, nlm_sigma);
+    }
+    if (morpho_radius > 0)
+        for (int z = 0; z < nz; z++)
+            morpho_bg_remove_2d(data + z * slice_size, ny, nx, morpho_radius);
+}

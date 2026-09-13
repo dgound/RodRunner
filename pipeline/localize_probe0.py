@@ -46,6 +46,15 @@ _ap.add_argument('--min_sbr', type=float, default=0.0,
                  help='Minimum signal-to-background ratio (amplitude/background) '
                       'to accept a fit. Spots below this are treated as failed. '
                       '0 disables (default).')
+_ap.add_argument('--preprocess-radius', dest='preprocess_radius', type=int, default=20,
+                 help='Morphological background-removal disk radius in px (default 20).')
+_ap.add_argument('--preprocess-wavelet-levels', dest='preprocess_wavelet_levels', type=int, default=3,
+                 help='Haar wavelet denoise levels, 0 disables (default 3).')
+_ap.add_argument('--preprocess-diffusion-iters', dest='preprocess_diffusion_iters', type=int, default=5,
+                 help='Anisotropic diffusion iterations, 0 disables (default 5).')
+_ap.add_argument('--preprocess-nlm', dest='preprocess_nlm', type=float, nargs=3, default=None,
+                 metavar=('SEARCH_R', 'PATCH_R', 'SIGMA'),
+                 help='Add non-local-means denoising with these parameters (default off).')
 _ap.add_argument('--no-preprocess', '--no_preprocess', dest='no_preprocess',
                  action='store_true',
                  help='Disable image preprocessing before fitting.')
@@ -154,7 +163,19 @@ elif os.path.exists(_preprocess_lib_path):
     _pp.preprocess_denoise_morpho.argtypes = [
         ctypes.POINTER(ctypes.c_double),
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-    print('Preprocessing: denoise+morpho enabled (preprocess3d.so)')
+    _pp.preprocess_custom.restype = None
+    _pp.preprocess_custom.argtypes = [
+        ctypes.POINTER(ctypes.c_double), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_double,
+        ctypes.c_int, ctypes.c_int, ctypes.c_double]
+    _pp_custom = (_args.preprocess_radius != 20 or _args.preprocess_wavelet_levels != 3
+                  or _args.preprocess_diffusion_iters != 5 or _args.preprocess_nlm is not None)
+    if _pp_custom:
+        print(f'Preprocessing: custom (radius={_args.preprocess_radius}, wavelet_levels='
+              f'{_args.preprocess_wavelet_levels}, diffusion_iters={_args.preprocess_diffusion_iters}, '
+              f'nlm={_args.preprocess_nlm})')
+    else:
+        print('Preprocessing: denoise+morpho enabled (preprocess3d.so)')
 else:
     _pp = None
     print('Preprocessing: disabled (preprocess3d.so not found)')
@@ -412,9 +433,17 @@ with open(out_csv, 'w', newline='') as csvfile:
         img = img.astype(np.float64)
         if _pp is not None:
             img = np.ascontiguousarray(img)
-            _pp.preprocess_denoise_morpho(
-                img.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                img.shape[0], img.shape[1], img.shape[2], 20)
+            if _pp_custom:
+                nlm = _args.preprocess_nlm or (0, 0, 0.0)
+                _pp.preprocess_custom(
+                    img.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                    img.shape[0], img.shape[1], img.shape[2], _args.preprocess_radius,
+                    _args.preprocess_wavelet_levels, _args.preprocess_diffusion_iters, 30.0,
+                    int(nlm[0]), int(nlm[1]), float(nlm[2]))
+            else:
+                _pp.preprocess_denoise_morpho(
+                    img.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                    img.shape[0], img.shape[1], img.shape[2], 20)
         if img.shape != masks.shape:
             raise ValueError(
                 f'Shape mismatch at {tp_name}: img={img.shape} vs mask={masks.shape}. '
