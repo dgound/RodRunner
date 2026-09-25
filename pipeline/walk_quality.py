@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Walk quality: the chance that every locus of a walk is placed within a distance limit of its true position.
 
-Runs after the merge, with or without trace salvage. Adds the column ``WalkChanceAllLociGood`` (0-1, one value per
+Runs after the merge, with or without trace salvage. Adds the column ``WalkQuality`` (0-1, one value per
 walk, repeated on each of its rows) to ``all_locations_640_valid_walks.csv`` and
 ``all_locations_640_valid_walks_nosuspect_movement.csv`` and writes ``walk_quality.json`` next to them.
 
@@ -19,7 +19,7 @@ Method (all inputs are the per-Location ``localizations_640_drift_corrected.csv`
 3. The chance that a localization of each label is further than the limit from its true position is fitted on the
    repeat pair (the same locus imaged twice, --repeat_pair_1based, all walks, before the movement filter):
    P(pair further apart than the limit) = 1 - (1 - q_label_first)(1 - q_label_repeat), maximum likelihood over q.
-4. WalkChanceAllLociGood = product over the walk's loci of (1 - q_label).
+4. WalkQuality = product over the walk's loci of (1 - q_label).
 5. Check: on a second repeat pair if the acquisition has one (the next locus re-imaged, accepted only if its two
    images agree like a repeat), otherwise on held-out half of the walks; the result goes into walk_quality.json.
 """
@@ -36,7 +36,8 @@ import numpy as np
 from scipy.optimize import minimize
 
 csv.field_size_limit(10 ** 9)
-COLUMN = 'WalkChanceAllLociGood'
+COLUMN = 'WalkQuality'
+OLD_COLUMNS = ('WalkChanceAllLociGood',)   # earlier name, removed when the file is rewritten
 MERGED_FILES = ('all_locations_640_valid_walks.csv', 'all_locations_640_valid_walks_nosuspect_movement.csv')
 FLAG_LABELS = ('failed', 'width_off', 'low_signal')
 N_CLEAN = 10
@@ -229,7 +230,7 @@ def add_column(path, scores):
     n_rows = n_scored = 0
     with open(path, newline='') as src, open(tmp, 'w', newline='') as dst:
         rd = csv.DictReader(src)
-        fields = [f for f in rd.fieldnames if f != COLUMN] + [COLUMN]
+        fields = [f for f in rd.fieldnames if f != COLUMN and f not in OLD_COLUMNS] + [COLUMN]
         wr = csv.DictWriter(dst, fieldnames=fields, extrasaction='ignore')
         wr.writeheader()
         for row in rd:

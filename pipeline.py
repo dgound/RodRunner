@@ -490,7 +490,7 @@ def run_merge(args, output_dir, env):
 
 
 def run_walk_quality(args, output_dir, env):
-    """Last step: add WalkChanceAllLociGood to the merged files (runs with or without salvage)."""
+    """Last step: add WalkQuality to the merged files (runs with or without salvage)."""
     run_step('Walk quality', [
         sys.executable, str(PIPELINE_DIR / 'walk_quality.py'),
         '--base', output_dir,
