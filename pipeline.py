@@ -489,6 +489,20 @@ def run_merge(args, output_dir, env):
     run_step(label, cmd, env)
 
 
+def run_walk_quality(args, output_dir, env):
+    """Last step: add WalkChanceAllLociGood to the merged files (runs with or without salvage)."""
+    run_step('Walk quality', [
+        sys.executable, str(PIPELINE_DIR / 'walk_quality.py'),
+        '--base', output_dir,
+        '--location_prefix', args.location_glob.split('*')[0],
+        '--tp_start', str(args.replication_tp_start),
+        '--tp_end', str(args.replication_tp_end),
+        '--repeat_pair_1based', str(args.movement_pair[0]), str(args.movement_pair[1]),
+        '--xy_pixel_nm', str(args.xy_pixel_nm),
+        '--z_step_nm', str(args.z_step_nm),
+    ], env)
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -597,6 +611,12 @@ def main(argv=None):
             run_merge(args, output_dir, env)
         except Exception as exc:
             print(f'[FAIL] Merge: {exc}', file=sys.stderr)
+            return 1
+        print(sep)
+        try:
+            run_walk_quality(args, output_dir, env)
+        except Exception as exc:
+            print(f'[FAIL] Walk quality: {exc}', file=sys.stderr)
             return 1
 
     print(sep)
