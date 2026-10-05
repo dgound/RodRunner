@@ -4,15 +4,16 @@ OligoSTORM widefield imaging pipeline for *Salmonella* chromosome tracing.
 
 Segments cells, localizes fluorescent loci in 3D, detects replication via
 two-spot Gaussian fitting, corrects stage drift, classifies replication
-state, and optionally merges per-location results with trace salvage.
+state, merges per-location results with trace salvage, and scores the
+localization quality of every walk.
 
 ## Installation
 
 Requires Python >= 3.9.
 
 ```bash
-git clone https://github.com/dgound/Salmonella_WF.git
-cd Salmonella_WF
+git clone https://github.com/dgound/RodRunner.git
+cd RodRunner
 pip install .
 ```
 
@@ -22,8 +23,10 @@ For GPU-accelerated Cellpose segmentation:
 pip install ".[gpu]"
 ```
 
-The localization step compiles a small C library (`pipeline/gauss3d_fit.c`)
-automatically on first run. A working C compiler (gcc) is required.
+The C helpers under `pipeline/` (`gauss3d_fit.c`, `preprocess3d.c`,
+`replication_qc_fit.c`) are compiled automatically on first use. A working
+C compiler (gcc) is required. The optional topology engine is built by hand
+(see [Topology](#topology)).
 
 ## Quick start
 
@@ -31,46 +34,64 @@ automatically on first run. A working C compiler (gcc) is required.
 python pipeline.py --input /path/to/raw --output /path/to/results
 ```
 
-This runs the full pipeline with tightened-analysis defaults on `.dat` input.
-All detection gates (SE-corrected LCB, amplitude ratio, spot separation) are
-set to their publication values out of the box.
+This runs the full pipeline on `.dat` input. Pixel size, z step and FOV size
+are read from each dataset's `data.json`, image preprocessing is on, the
+detection gates (SE-corrected LCB, amplitude ratio, spot separation) are at
+their publication values, and after the per-location steps the merge runs
+trace salvage and walk quality.
 
 ## Pipeline steps
+
+Per location:
 
 | Step | Script | Description |
 |------|--------|-------------|
 | 1 | `run_cellpose.py` | Cell segmentation (2.5D z-gated by default) |
 | 2 | `split_clump_masks.py` | Clump splitting (stitched mode only) |
-| 3 | `localize_probe0.py` | 3D Gaussian localization of 640 nm probe |
-| 3b | `center_ownership.py` | Assign localization ownership to nearest cell |
-| 4 | `localize_488.py` | Localize 488 nm probe |
+| 3 | `localize_probe0.py` | Image preprocessing (wavelet denoise, anisotropic diffusion, background removal) and 3D Gaussian localization of the 640 nm probe |
+| 3b | `center_ownership.py` | Assign localizations to cells |
+| 4 | `localize_488.py` | Localize the 488 nm fiducial probe |
 | 5 | `replication_qc.py` | Two-spot replication detection with BIC model selection |
 | 6 | `drift_correct.py` | Stage drift correction + movement QC |
 | 7 | `classify_replication.py` | Classify replication state (Ori/Ter assignment) |
-| merge | `merge_all_walks.py` | Dataset-level merge with optional trace salvage |
 
-All scripts live under `pipeline/` (steps 1-7) or `drivers/` (merge).
+After all locations:
+
+| Step | Script | Description |
+|------|--------|-------------|
+| merge | `drivers/merge_all_walks.py` | Dataset-level merge; trace salvage runs by default (needs >= 2 locations) |
+| walk quality | `pipeline/walk_quality.py` | Adds `WalkQuality` and SNR columns to both merged files |
+
+Steps 1-7 and walk quality live under `pipeline/`, the merge under
+`drivers/`. `--no-merge` skips both dataset-level steps.
 
 ## Examples
 
-Minimal `.dat` run with default geometry:
+Minimal `.dat` run:
 
 ```bash
 python pipeline.py --input /data/experiment --output /data/results
 ```
 
-Non-default pixel size and FOV:
+Override the detector geometry (normally read from `data.json`):
 
 ```bash
 python pipeline.py --input /data/novo --output /data/novo_results \
     --xy-pixel-nm 101.38 --fov-size 2304
 ```
 
-Confocal dataset (different geometry, no movement QC):
+Centroid drift correction with chromatic registration from metadata:
+
+```bash
+python pipeline.py --input /data/experiment --output /data/results \
+    --drift-xy-method centroid --chromatic-registration metadata
+```
+
+Confocal dataset (TIFF input, different geometry, no movement QC):
 
 ```bash
 python pipeline.py --input /data/confocal --output /data/confocal_out \
-    --xy-pixel-nm 81.25 --z-step-nm 180 --sigma-z-max 0 \
+    --source tiff --xy-pixel-nm 81.25 --z-step-nm 180 \
     --replication-tp-start 0 --replication-tp-end 19 \
     --movement-policy disabled --segmentation stitched
 ```
@@ -82,11 +103,10 @@ python pipeline.py --input /data/experiment --output /data/results \
     --skip-segmentation --mask-dir /data/previous_run
 ```
 
-With trace salvage:
+Merge without trace salvage:
 
 ```bash
-python pipeline.py --input /data/experiment --output /data/results \
-    --salvage --dataset-id my_experiment
+python pipeline.py --input /data/experiment --output /data/results --no-salvage
 ```
 
 ## CLI reference
@@ -97,26 +117,42 @@ python pipeline.py --input /data/experiment --output /data/results \
 |------|---------|-------------|
 | `--input` | (required) | Root directory containing Location subdirectories |
 | `--output` | (required) | Output directory for results |
-| `--source` | `dat` | Input format: `dat` (raw Vutara) or `tiff` (pre-extracted) |
+| `--source` | `dat` | Input format: `dat` (raw Vutara) or `tiff` (pre-extracted stacks) |
 | `--location-glob` | `Location-*` | Glob pattern for location discovery |
-| `--locations` | | Explicit location list (overrides glob) |
+| `--locations` | | Explicit location list (overrides the glob) |
 
-### Detector geometry
+### Detector geometry and fitting
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--xy-pixel-nm` | `103.28` | Lateral pixel size in nm |
-| `--z-step-nm` | `100.0` | Axial step size in nm |
-| `--fov-size` | `1866` | FOV size in pixels (assumed square) |
-| `--sigma-z-max` | `3.5` | Axial sigma cap in voxels (0 = uncapped) |
+| `--xy-pixel-nm` | from `data.json` | Lateral pixel size in nm |
+| `--z-step-nm` | from `data.json` | Axial step size in nm |
+| `--fov-size` | from `data.json` | FOV size in pixels (assumed square) |
+| `--sigma-z-max` | `0` | Axial sigma cap in voxels (0 = uncapped) |
+| `--min-sbr` | `0` | Minimum amplitude/background to accept a fit (0 = off) |
+
+Geometry is read from `<Location>/Raw Images/data.json` for `.dat` input.
+With `--source tiff`, or when no `data.json` is found, the fallback is
+103.28 nm, 100 nm and 1866 px; pass the three flags explicitly in that case.
+
+### Preprocessing
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--preprocess-radius` | `20` | Background-removal disk radius in px |
+| `--preprocess-wavelet-levels` | `3` | Wavelet denoise levels (0 disables) |
+| `--preprocess-diffusion-iters` | `5` | Anisotropic-diffusion iterations (0 disables) |
+| `--preprocess-nlm SEARCH_R PATCH_R SIGMA` | off | Add non-local-means denoising |
+| `--no-preprocess` | off | Disable preprocessing before fitting |
 
 ### Segmentation
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--segmentation` | `2p5d-zgated` | Mode: `2p5d-zgated`, `2p5d`, `stitched`, `3d` |
-| `--skip-segmentation` | off | Use existing masks |
-| `--mask-dir` | | Path to existing mask tree (with `--skip-segmentation`) |
+| `--diameter` | `20` | Expected cell diameter in pixels for Cellpose |
+| `--skip-segmentation` | off | Use existing masks (in `--output` or `--mask-dir`) |
+| `--mask-dir` | | Tree with existing masks, same layout as an output tree |
 
 ### Detection gates
 
@@ -138,10 +174,11 @@ python pipeline.py --input /data/experiment --output /data/results \
 | `--replication-tp-start` | `2` | First genomic locus TP (0-based) |
 | `--replication-tp-end` | `21` | Last genomic locus TP (0-based) |
 
-### Movement QC
+### Drift correction and movement QC
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--drift-xy-method` | `rod_registration` | XY drift estimation: `rod_registration` or `centroid` |
 | `--movement-policy` | `xy_repeatability` | Policy: `xy_repeatability`, `xyz_repeatability_legacy`, `disabled` |
 | `--movement-max-nm` | `100.0` | Movement threshold in nm |
 | `--movement-pair` | `3 23` | Same-locus re-image pair (1-based TPs) |
@@ -150,45 +187,90 @@ python pipeline.py --input /data/experiment --output /data/results \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--no-merge` | off | Skip dataset-level merge |
-| `--salvage` | off | Run trace salvage during merge |
-| `--dataset-id` | output dir name | Dataset identity for merge outputs |
+| `--no-merge` | off | Skip the dataset-level merge and walk quality |
+| `--no-salvage` | off | Merge without trace salvage (salvage runs by default; skipped automatically with fewer than two locations) |
+| `--dataset-id` | output dir name | Prefix of the salvage output files |
 
 ## Input layout
 
-The pipeline expects Location subdirectories under `--input`. For `.dat`
-sources, each location must contain a `Raw Images/` directory with Vutara
-`.dat` files. For `.tiff` sources, each location must have an `output/`
-directory with per-probe TIFF stacks.
+For `.dat` sources each location holds a `Raw Images/` directory with the
+Vutara `.dat` files and `data.json`:
 
 ```
 input/
-  Location-1/
+  Location-01/
     Raw Images/
+      data.json
       *.dat
-  Location-2/
-    Raw Images/
-      *.dat
-  ...
+  Location-02/
+    ...
+```
+
+For `tiff` sources each location holds per-probe stacks, either under an
+`output/` directory or directly in the location (`probe_0` = 640 nm loci,
+`probe_1` = 488 nm fiducial, `probe_2` = DAPI):
+
+```
+input/
+  Location-01/
+    output/
+      probe_0/TP*.tif
+      probe_1/TP*.tif
+      probe_2/TP*.tif
 ```
 
 ## Output layout
 
 ```
 output/
-  Location-1/
+  Location-01/
     probe_0/localizations/
       localizations_640.csv
+      localizations_640_center_ownership_walks.csv
       localizations_640_replication_qc.csv
-      localizations_640_classified.csv
+      localizations_640_drift_corrected.csv
+      localizations_640_drift_corrected_filtered.csv
+      localizations_640_drift_corrected_full_coverage.csv
+      localizations_640_replication_classification.csv
+      localizations_640_walk_replication_summary.csv
     probe_1/localizations/
       localizations_488.csv
     probe_2/cellpose_masks/
       masks_final.tif
-  Location-2/
+  Location-02/
     ...
   merged/
-    all_walks_merged.csv
+    all_locations_640_valid_walks.csv
+    all_locations_640_valid_walks_nosuspect_movement.csv
+    walk_quality.json
+    <dataset-id>_trace_salvage_full_schema.csv
+    <dataset-id>_trace_salvage_manifest.json
+```
+
+`all_locations_640_valid_walks.csv` holds every walk localized at all
+genomic loci. `all_locations_640_valid_walks_nosuspect_movement.csv` is the
+analysis set: the walks that pass the movement check and have no unresolved
+two-spot locus after salvage. Both carry the same columns, including the
+walk-quality columns:
+
+- `WalkQuality` (0-1): mean over the genomic loci of each spot's chance of
+  lying within the median neighbour-locus distance of its true position,
+  learned from the same-locus re-image pair.
+- `MedianSNR`, `SNRPercentile`, `SNRAgreementScore`, `FirstSNR`, `RepeatSNR`:
+  signal-to-noise of the spots measured on the raw images.
+- `RepeatSeparation3D_nm`: 3D distance between the first and repeat image of
+  the re-imaged locus.
+
+`walk_quality.json` records the calibration (distance limit, per-label
+chances, SNR groups) for the run.
+
+## Topology
+
+`pipeline/detect_topology.py` detects theta curves and links on a merged
+analysis set. It needs the C engine, built once by hand:
+
+```bash
+gcc -O3 -fopenmp -shared -fPIC -o pipeline/topology_engine.so pipeline/topology_engine.c -lm
 ```
 
 ## License
