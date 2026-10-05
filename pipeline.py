@@ -490,10 +490,12 @@ def run_merge(args, output_dir, env):
 
 
 def run_walk_quality(args, output_dir, env):
-    """Last step: add WalkQuality to the merged files (runs with or without salvage)."""
+    """Last step: mean WalkQuality and SNR/repeat columns, with or without salvage."""
     run_step('Walk quality', [
         sys.executable, str(PIPELINE_DIR / 'walk_quality.py'),
         '--base', output_dir,
+        '--input', args.input,
+        '--source', args.source,
         '--location_prefix', args.location_glob.split('*')[0],
         '--tp_start', str(args.replication_tp_start),
         '--tp_end', str(args.replication_tp_end),

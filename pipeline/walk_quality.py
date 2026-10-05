@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Walk quality: the chance that every locus of a walk is placed within a distance limit of its true position.
+"""Walk quality: mean spot reliability, raw-image SNR, and repeat agreement.
 
-Runs after the merge, with or without trace salvage. Adds the column ``WalkQuality`` (0-1, one value per
+Runs after the merge, with or without trace salvage. Adds ``WalkQuality`` and six SNR/repeat columns (one value per
 walk, repeated on each of its rows) to ``all_locations_640_valid_walks.csv`` and
 ``all_locations_640_valid_walks_nosuspect_movement.csv`` and writes ``walk_quality.json`` next to them.
 
-Method (all inputs are the per-Location ``localizations_640_drift_corrected.csv`` files; no raw images):
+Inputs are per-Location ``localizations_640_drift_corrected.csv`` files and original images.
+The genomic locus range and repeat pair come from the driver, not a fixed layout.
 
 1. Each localization gets one label, first match wins:
    fit failed  - non-finite error, any axis error > 2 px, sigma_z at its lower bound or at the stack depth
@@ -19,9 +20,14 @@ Method (all inputs are the per-Location ``localizations_640_drift_corrected.csv`
 3. The chance that a localization of each label is further than the limit from its true position is fitted on the
    repeat pair (the same locus imaged twice, --repeat_pair_1based, all walks, before the movement filter):
    P(pair further apart than the limit) = 1 - (1 - q_label_first)(1 - q_label_repeat), maximum likelihood over q.
-4. WalkQuality = product over the walk's loci of (1 - q_label).
+4. WalkQuality = mean over the walk's loci of (1 - q_label).
 5. Check: on a second repeat pair if the acquisition has one (the next locus re-imaged, accepted only if its two
    images agree like a repeat), otherwise on held-out half of the walks; the result goes into walk_quality.json.
+
+SNR is measured on original input images using original fit centers (including salvaged walks).
+MedianSNR excludes the repeat. SNRPercentile uses the delivered analysis set as its reference in both CSVs.
+SNRAgreementScore is the observed repeat-agreement fraction in whole-walk median-SNR quantile groups,
+learned before movement filtering. See docs/walk_quality_metrics.md for definitions and missing-value rules.
 """
 import argparse
 import csv
@@ -35,8 +41,14 @@ import sys
 import numpy as np
 from scipy.optimize import minimize
 
+try:
+    from . import walk_snr
+except ImportError:
+    import walk_snr
+
 csv.field_size_limit(10 ** 9)
 COLUMN = 'WalkQuality'
+COLUMNS = (COLUMN,) + walk_snr.SNR_COLUMNS
 OLD_COLUMNS = ('WalkChanceAllLociGood',)   # earlier name, removed when the file is rewritten
 MERGED_FILES = ('all_locations_640_valid_walks.csv', 'all_locations_640_valid_walks_nosuspect_movement.csv')
 FLAG_LABELS = ('failed', 'width_off', 'low_signal')
@@ -87,6 +99,7 @@ def load(base, prefix, px, zs):
                     or (nz is not None and sz >= nz - 0.5)
                 walks.setdefault((loc, r['WalkID']), {})[_tp(r['tp'])] = dict(
                     x=_f(r['x_nm']), y=_f(r['y_nm']), z=_f(r['z_nm']), ex=ex, ey=ey, ez=ez,
+                    x_raw=_f(r.get('x_raw')), y_raw=_f(r.get('y_raw')), z_raw=_f(r.get('z_raw')),
                     failed=bool(failed), width_off=bool(0.5 * (sx + sy) < 1.2 or 0.5 * (sx + sy) > 5.0),
                     intensity=_f(r['amplitude']) * sx * sy * sz)
     return walks
@@ -100,7 +113,8 @@ class Model:
     def __init__(self, walks, loci, rep_a, rep_b, cells=None):
         self.loci = loci
         self.W = walks
-        cells = list(walks) if cells is None else cells
+        cells = [k for k in (walks if cells is None else cells)
+                 if all(t in walks[k] for t in loci)]
         inten = np.array([r['intensity'] for c in walks.values() for r in c.values()])
         inten = inten[np.isfinite(inten)]
         self.low_signal_threshold = float(np.percentile(inten, 5)) if len(inten) else float('nan')
@@ -108,16 +122,23 @@ class Model:
             for r in c.values():
                 r['low_signal'] = bool(not np.isfinite(r['intensity']) or r['intensity'] < self.low_signal_threshold)
                 r['flag'] = r['failed'] or r['width_off'] or r['low_signal']
-        pairs = [(walks[k][rep_a], walks[k][rep_b]) for k in cells if rep_a in walks[k] and rep_b in walks[k]]
+        pairs = [(walks[k][rep_a], walks[k][rep_b]) for k in cells
+                 if rep_a in walks[k] and rep_b in walks[k]
+                 and np.isfinite(_d3(walks[k][rep_a], walks[k][rep_b]))]
         clean = [(a, b) for a, b in pairs if not a['flag'] and not b['flag']]
         if len(clean) < 100:
             raise ValueError(f'only {len(clean)} clean repeat pairs ({rep_a} vs {rep_b}); need at least 100')
         # per-dataset rescaling of the fit's axis errors (sets the relative weight of x, y and z)
-        rx = [(b['x'] - a['x']) / math.hypot(a['ex'], b['ex']) for a, b in clean]
-        ry = [(b['y'] - a['y']) / math.hypot(a['ey'], b['ey']) for a, b in clean]
-        rz = [(b['z'] - a['z']) / math.hypot(a['ez'], b['ez']) for a, b in clean]
+        rx = [(b['x'] - a['x']) / math.hypot(a['ex'], b['ex']) for a, b in clean
+              if math.hypot(a['ex'], b['ex']) > 0]
+        ry = [(b['y'] - a['y']) / math.hypot(a['ey'], b['ey']) for a, b in clean
+              if math.hypot(a['ey'], b['ey']) > 0]
+        rz = [(b['z'] - a['z']) / math.hypot(a['ez'], b['ez']) for a, b in clean
+              if math.hypot(a['ez'], b['ez']) > 0]
         self.kxy = math.sqrt((_rsd(rx) ** 2 + _rsd(ry) ** 2) / 2)
         self.kz = _rsd(rz)
+        if not np.isfinite([self.kxy, self.kz]).all():
+            raise ValueError('repeat pairs do not provide finite axis-error scales')
         # one localization's 3D error, from the repeat scatter
         self.error_3d_nm = math.sqrt(sum(_rsd([b[ax] - a[ax] for a, b in clean]) ** 2 for ax in 'xyz') / 2)
         # distance limit: median neighbour distance (circular), measurement error removed
@@ -130,7 +151,11 @@ class Model:
             for i in range(n):
                 a, b = c[loci[i]], c[loci[(i + 1) % n]]
                 if not a['flag'] and not b['flag']:
-                    gaps.append(_d3(a, b))
+                    gap = _d3(a, b)
+                    if np.isfinite(gap):
+                        gaps.append(gap)
+        if not gaps:
+            raise ValueError('no finite unflagged neighbour distances')
         self.neighbour_median_nm = float(np.median(gaps))
         self.limit_nm = math.sqrt(max(0.0, self.neighbour_median_nm ** 2 - 2 * self.error_3d_nm ** 2))
         # clean groups by the rescaled fit uncertainty
@@ -173,7 +198,9 @@ class Model:
         return self.q.get(self.label(r), self.q['failed'])
 
     def chance(self, c, exclude=()):
-        return float(np.prod([1 - self.q_of(c[t]) for t in self.loci if t not in exclude]))
+        """Mean per-spot reliability, not the probability that all loci are good."""
+        values = [1 - self.q_of(c[t]) for t in self.loci if t not in exclude]
+        return float(np.mean(values)) if values else float('nan')
 
 
 def _auc(score, y):
@@ -224,28 +251,47 @@ def check(walks, loci, rep_a, rep_b, model):
                 auc_walk_chance=_auc(-np.array(ch), obs))
 
 
-def add_column(path, scores):
-    """Stream-rewrite a merged CSV with the score column appended (replaced if present); atomic rename."""
+def merged_keys(path):
+    """Read the merge driver's cell universe; never rebuild its selection."""
+    if not os.path.isfile(path):
+        return set()
+    with open(path, newline='') as fh:
+        rd = csv.DictReader(fh)
+        if not {'Location', 'orig_ID'}.issubset(rd.fieldnames or []):
+            raise ValueError(f'{path}: Location and orig_ID are required for quality joins')
+        return {(r['Location'], r['orig_ID']) for r in rd}
+
+
+def add_columns(path, metrics):
+    """Atomic per-file rewrite, preserving every row, coordinate and merge/salvage ID."""
     tmp = path + '.walk_quality_tmp'
-    n_rows = n_scored = 0
+    n_rows = 0
+    counts = {column: 0 for column in COLUMNS}
     with open(path, newline='') as src, open(tmp, 'w', newline='') as dst:
         rd = csv.DictReader(src)
-        fields = [f for f in rd.fieldnames if f != COLUMN and f not in OLD_COLUMNS] + [COLUMN]
+        if not {'Location', 'orig_ID'}.issubset(rd.fieldnames or []):
+            raise ValueError(f'{path}: Location and orig_ID are required for quality joins')
+        fields = [f for f in rd.fieldnames if f not in COLUMNS and f not in OLD_COLUMNS] + list(COLUMNS)
         wr = csv.DictWriter(dst, fieldnames=fields, extrasaction='ignore')
         wr.writeheader()
         for row in rd:
-            v = scores.get((row.get('Location', ''), str(row.get('orig_ID', ''))))
-            row[COLUMN] = '' if v is None else f'{v:.4f}'
+            values = metrics.get((row['Location'], row['orig_ID']), {})
+            for column in COLUMNS:
+                value = values.get(column)
+                available = value is not None and np.isfinite(value)
+                row[column] = f'{value:.6f}' if available else ''
+                counts[column] += int(available)
             n_rows += 1
-            n_scored += v is not None
             wr.writerow(row)
     os.replace(tmp, path)
-    return n_rows, n_scored
+    return n_rows, counts
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--base', required=True, help='pipeline output directory holding the Location folders')
+    ap.add_argument('--input', required=True, help='original input root, with Location folders')
+    ap.add_argument('--source', choices=('dat', 'tiff'), default='dat')
     ap.add_argument('--merged', default=None, help='merged directory (default: <base>/merged)')
     ap.add_argument('--location_prefix', required=True)
     ap.add_argument('--tp_start', type=int, required=True, help='first genomic locus, 0-based TP index')
@@ -257,10 +303,16 @@ def main(argv=None):
     merged = a.merged or os.path.join(a.base, 'merged')
     loci = [f'TP{i:03d}' for i in range(a.tp_start, a.tp_end + 1)]
     rep_a, rep_b = (f'TP{i - 1:03d}' for i in a.repeat_pair_1based)
-    summary = dict(column=COLUMN, loci=[loci[0], loci[-1]], repeat_pair=[rep_a, rep_b],
+    if not loci or rep_a not in loci or rep_b in loci:
+        ap.error('require a nonempty locus range containing FIRST and excluding REPEAT')
+    summary = dict(schema_version=2, column=COLUMN, columns=list(COLUMNS), aggregation='mean',
+                   loci=[loci[0], loci[-1]], repeat_pair=[rep_a, rep_b],
                    xy_pixel_nm=a.xy_pixel_nm, z_step_nm=a.z_step_nm)
     walks = load(a.base, a.location_prefix, a.xy_pixel_nm, a.z_step_nm)
+    analysis_keys = merged_keys(os.path.join(merged, MERGED_FILES[1]))
+    full = [k for k, c in walks.items() if all(t in c for t in loci)]
     print(f'[walk_quality] {len(walks)} walks loaded; repeat pair {rep_a} vs {rep_b}')
+    model = None
     try:
         model = Model(walks, loci, rep_a, rep_b)
     except ValueError as exc:
@@ -268,7 +320,6 @@ def main(argv=None):
         summary['status'] = f'skipped: {exc}'
         scores = {}
     else:
-        full = [k for k, c in walks.items() if all(t in c for t in loci)]
         scores = {(k[0], str(k[1])): model.chance(walks[k]) for k in full}
         v = np.array(list(scores.values()))
         summary.update(
@@ -281,7 +332,7 @@ def main(argv=None):
             check=check(walks, loci, rep_a, rep_b, model))
         if model.limit_nm < model.error_3d_nm:
             warn = (f'localization error ({model.error_3d_nm:.0f} nm) is not smaller than the distance limit '
-                    f'({model.limit_nm:.0f} nm): no walk can be trusted at locus resolution, scores are near 0')
+                    f'({model.limit_nm:.0f} nm): localization error is large relative to locus spacing')
             summary['warning'] = warn
             print(f'[walk_quality] WARNING: {warn}', file=sys.stderr)
         c = summary['check']
@@ -293,12 +344,27 @@ def main(argv=None):
                   f'vs observed {100 * c["observed_pairs_off"]:.1f}% pairs off, AUC {c["auc_walk_chance"]:.3f}')
         else:
             print(f'[walk_quality] check {c["method"]}')
+    measured, snr_summary = walk_snr.measure_spots(walks, loci, rep_a, rep_b, a.input, a.source)
+    metrics, grouping = walk_snr.summarize(
+        walks, loci, rep_a, rep_b, measured, analysis_keys,
+        model.limit_nm if model is not None else None)
+    for key, value in scores.items():
+        metrics.setdefault(key, {})[COLUMN] = value
+    snr_summary.update(grouping)
+    summary['snr'] = snr_summary
+    summary['analysis_set_walks'] = len(analysis_keys)
+    if snr_summary['image_errors']:
+        print(f'[walk_quality] SNR image errors: {snr_summary["image_errors"]}', file=sys.stderr)
     for name in MERGED_FILES:
         p = os.path.join(merged, name)
         if os.path.isfile(p):
-            n_rows, n_scored = add_column(p, scores)
-            summary.setdefault('files', {})[name] = dict(rows=n_rows, rows_scored=n_scored)
-            print(f'[walk_quality] {name}: {COLUMN} written to {n_scored}/{n_rows} rows')
+            keys = merged_keys(p)
+            n_rows, counts = add_columns(p, metrics)
+            summary.setdefault('files', {})[name] = dict(rows=n_rows, rows_scored=counts[COLUMN],
+                                                        available_rows_by_column=counts,
+                                                        unmatched_walks=len(keys - metrics.keys()))
+            print(f'[walk_quality] {name}: {COLUMN} written to {counts[COLUMN]}/{n_rows} rows; '
+                  f'MedianSNR to {counts["MedianSNR"]}/{n_rows} rows')
     with open(os.path.join(merged, 'walk_quality.json'), 'w') as fh:
         json.dump(summary, fh, indent=1)
     return 0
